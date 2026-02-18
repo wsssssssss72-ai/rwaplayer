@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: my-node-app
+    env: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    buildCommand: ""
+    startCommand: ""
+    envVars:
+      - key: NODE_ENV
+        value: production
+    ports:
+      - 3000
