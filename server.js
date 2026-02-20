@@ -64,6 +64,40 @@ app.get('/segment', async (req, res) => {
   }
 });
 
+// NEW: Download complete video as MP4
+app.get('/download', async (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  const { url } = req.query;
+  
+  if (!url) {
+    return res.status(400).send('Missing url parameter');
+  }
+
+  try {
+    // Set headers for download
+    res.setHeader('Content-Disposition', `attachment; filename="video_${Date.now()}.mp4"`);
+    res.setHeader('Content-Type', 'video/mp4');
+    
+    // Fetch the video with appropriate headers
+    const response = await axios.get(url, {
+      headers: {
+        "accept": "*/*",
+        "Referer": "https://appx-play.akamai.net.in/",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+      },
+      responseType: 'stream',
+      maxRedirects: 5
+    });
+
+    // Pipe the video stream directly to response
+    response.data.pipe(res);
+    
+  } catch (err) {
+    console.error('Error downloading video:', err.message);
+    res.status(500).send('Download error: ' + err.message);
+  }
+});
+
 // PDF routes
 app.get('/pdf', async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -273,7 +307,7 @@ app.get('/pdf-viewer', async (req, res) => {
   }
 });
 
-// SNOW PLAYER - Professional Minimalist UI
+// SNOW PLAYER - Professional Minimalist UI with Download
 app.get('/player', (req, res) => {
   const { url } = req.query;
   
@@ -592,9 +626,47 @@ app.get('/player', (req, res) => {
       opacity: 1;
     }
 
+    /* Download Button - New */
+    #download-btn {
+      color: rgba(255,255,255,0.9);
+    }
+
+    #download-btn:hover {
+      color: #fff;
+      background: rgba(255,255,255,0.1);
+    }
+
     /* Fullscreen Button */
     #fullscreen-btn {
       font-size: 18px;
+    }
+
+    /* Download Progress Indicator */
+    .download-progress {
+      position: fixed;
+      top: 20px;
+      right: 20px;
+      background: rgba(0,0,0,0.8);
+      backdrop-filter: blur(10px);
+      -webkit-backdrop-filter: blur(10px);
+      color: white;
+      padding: 10px 20px;
+      border-radius: 30px;
+      font-size: 13px;
+      border: 1px solid rgba(255,255,255,0.1);
+      z-index: 100;
+      display: none;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .download-progress.active {
+      display: flex;
+    }
+
+    .download-progress i {
+      color: #4ecdc4;
+      animation: spin 1s linear infinite;
     }
 
     /* Mobile Optimizations */
@@ -606,12 +678,13 @@ app.get('/player', (req, res) => {
       #play-btn { width: 36px; height: 36px; }
       .time-display { font-size: 12px; padding: 3px 8px; }
       #volume-slider { width: 50px; }
+      .download-progress { top: 10px; right: 10px; padding: 8px 16px; font-size: 12px; }
     }
   </style>
 </head>
 <body>
   <div id="player-container">
-    <video id="video" playsinline></video>
+    <video id="video" playsinline crossorigin="anonymous"></video>
     
     <div id="loading">
       <div class="loader"></div>
@@ -620,6 +693,12 @@ app.get('/player', (req, res) => {
 
     <div class="quality-badge" id="quality-badge">
       <i class="fas fa-hd"></i> AUTO
+    </div>
+
+    <!-- Download Progress Indicator -->
+    <div class="download-progress" id="download-progress">
+      <i class="fas fa-circle-notch"></i>
+      <span>Downloading video...</span>
     </div>
     
     <div class="controls">
@@ -669,6 +748,11 @@ app.get('/player', (req, res) => {
               <div class="settings-item" data-speed="0.75">0.75x</div>
             </div>
           </div>
+
+          <!-- New Download Button -->
+          <button class="control-btn" id="download-btn" title="Download Video">
+            <i class="fas fa-download"></i>
+          </button>
           
           <button class="control-btn" id="fullscreen-btn">
             <i class="fas fa-expand"></i>
@@ -691,6 +775,7 @@ app.get('/player', (req, res) => {
       const volumeBtn = document.getElementById('volume-btn');
       const volumeSlider = document.getElementById('volume-slider');
       const fullscreenBtn = document.getElementById('fullscreen-btn');
+      const downloadBtn = document.getElementById('download-btn');
       const settingsBtn = document.getElementById('settings-btn');
       const settingsMenu = document.getElementById('settings-menu');
       const settingsDropdown = document.getElementById('settings-dropdown');
@@ -702,6 +787,7 @@ app.get('/player', (req, res) => {
       const playerContainer = document.getElementById('player-container');
       const controls = document.querySelector('.controls');
       const qualityBadge = document.getElementById('quality-badge');
+      const downloadProgress = document.getElementById('download-progress');
       
       // State
       let hls;
@@ -710,6 +796,7 @@ app.get('/player', (req, res) => {
       let isFullscreen = false;
       let isDragging = false;
       let hideQualityBadgeTimeout;
+      let currentVideoUrl = '';
       
       const url = new URLSearchParams(window.location.search).get('url');
       
@@ -719,6 +806,8 @@ app.get('/player', (req, res) => {
           showError('Missing stream URL');
           return;
         }
+
+        currentVideoUrl = url;
         
         if (Hls.isSupported()) {
           hls = new Hls({
@@ -903,6 +992,73 @@ app.get('/player', (req, res) => {
         }
       }
       
+      // DOWNLOAD FUNCTIONALITY
+      function downloadVideo() {
+        if (!currentVideoUrl) {
+          alert('No video URL available');
+          return;
+        }
+
+        // Show download progress
+        downloadProgress.classList.add('active');
+        
+        // Create download link
+        const downloadLink = document.createElement('a');
+        downloadLink.href = '/download?url=' + encodeURIComponent(currentVideoUrl);
+        downloadLink.download = 'snow_player_video_' + Date.now() + '.mp4';
+        downloadLink.target = '_blank';
+        
+        // Trigger download
+        document.body.appendChild(downloadLink);
+        downloadLink.click();
+        document.body.removeChild(downloadLink);
+        
+        // Hide progress after a delay (download starts)
+        setTimeout(() => {
+          downloadProgress.classList.remove('active');
+        }, 2000);
+        
+        // Optional: Show success message
+        setTimeout(() => {
+          const toast = document.createElement('div');
+          toast.style.cssText = \`
+            position: fixed;
+            bottom: 80px;
+            right: 20px;
+            background: rgba(0,0,0,0.8);
+            color: white;
+            padding: 10px 20px;
+            border-radius: 30px;
+            font-size: 13px;
+            z-index: 100;
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255,255,255,0.1);
+            animation: slideIn 0.3s ease;
+          \`;
+          toast.innerHTML = '<i class="fas fa-check" style="color: #4ecdc4; margin-right: 8px;"></i> Download started';
+          document.body.appendChild(toast);
+          
+          setTimeout(() => {
+            toast.style.animation = 'slideOut 0.3s ease';
+            setTimeout(() => toast.remove(), 300);
+          }, 3000);
+        }, 500);
+      }
+      
+      // Add slide animations
+      const style = document.createElement('style');
+      style.textContent = \`
+        @keyframes slideIn {
+          from { transform: translateX(100px); opacity: 0; }
+          to { transform: translateX(0); opacity: 1; }
+        }
+        @keyframes slideOut {
+          from { transform: translateX(0); opacity: 1; }
+          to { transform: translateX(100px); opacity: 0; }
+        }
+      \`;
+      document.head.appendChild(style);
+      
       // Event Listeners
       playerContainer.addEventListener('mousemove', showControls);
       playerContainer.addEventListener('touchstart', showControls);
@@ -1023,7 +1179,14 @@ app.get('/player', (req, res) => {
         });
       });
       
-      // FULLSCREEN FUNCTION - Click triggers fullscreen
+      // DOWNLOAD BUTTON EVENT
+      downloadBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        downloadVideo();
+        showControls();
+      });
+      
+      // FULLSCREEN FUNCTION
       fullscreenBtn.addEventListener('click', toggleFullscreen);
       
       function toggleFullscreen() {
@@ -1123,6 +1286,9 @@ app.get('/player', (req, res) => {
             break;
           case 'f':
             toggleFullscreen();
+            break;
+          case 'd':
+            downloadVideo();
             break;
         }
       });
