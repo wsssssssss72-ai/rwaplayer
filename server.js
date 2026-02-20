@@ -3,14 +3,38 @@ const axios = require('axios');
 const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
-const { exec } = require('child_process');
+const { exec, spawn } = require('child_process');
 const util = require('util');
 const execPromise = util.promisify(exec);
+const stream = require('stream');
+const { promisify } = require('util');
+const pipeline = promisify(stream.pipeline);
+const crypto = require('crypto');
+const os = require('os');
 
 const app = express();
-
 app.use(cors());
+app.use(express.json());
+
 const PORT = process.env.PORT || 3000;
+
+// Create temp directory with unique name for each instance
+const TEMP_DIR = path.join(os.tmpdir(), 'snow_player_' + Date.now());
+if (!fs.existsSync(TEMP_DIR)) {
+  fs.mkdirSync(TEMP_DIR, { recursive: true });
+}
+
+// Clean up temp files on exit
+process.on('exit', () => {
+  try {
+    fs.rmSync(TEMP_DIR, { recursive: true, force: true });
+  } catch (e) {}
+});
+
+// Helper function to generate unique filenames
+function generateFileName(extension = 'mp4') {
+  return `${crypto.randomBytes(8).toString('hex')}_${Date.now()}.${extension}`;
+}
 
 // Proxy for .m3u8 playlists
 app.get('/proxy', async (req, res) => {
@@ -22,8 +46,10 @@ app.get('/proxy', async (req, res) => {
     const response = await axios.get(url, {
       headers: {
         "accept": "*/*",
-        "Referer": "https://appx-play.akamai.net.in/"
-      }
+        "Referer": "https://appx-play.akamai.net.in/",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+      },
+      timeout: 30000
     });
 
     const base = url.substring(0, url.lastIndexOf('/') + 1);
@@ -54,9 +80,11 @@ app.get('/segment', async (req, res) => {
     const response = await axios.get(segmentUrl, {
       headers: {
         "accept": "*/*",
-        "Referer": "https://appx-play.akamai.net.in/"
+        "Referer": "https://appx-play.akamai.net.in/",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
       },
-      responseType: 'stream'
+      responseType: 'stream',
+      timeout: 30000
     });
 
     res.status(response.status);
@@ -70,192 +98,254 @@ app.get('/segment', async (req, res) => {
   }
 });
 
-// DOWNLOAD COMPLETE VIDEO - Using FFmpeg
+// ADVANCED DOWNLOAD ENDPOINT - Multiple methods with fallbacks
 app.get('/download', async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  const { url } = req.query;
+  const { url, method = 'auto' } = req.query;
   
   if (!url) {
-    return res.status(400).send('Missing url parameter');
+    return res.status(400).json({ error: 'Missing url parameter' });
   }
 
-  try {
-    // Create temp directory if it doesn't exist
-    const tempDir = path.join(__dirname, 'temp');
-    if (!fs.existsSync(tempDir)) {
-      fs.mkdirSync(tempDir);
-    }
+  const fileName = generateFileName();
+  const outputPath = path.join(TEMP_DIR, fileName);
+  
+  console.log(`Starting download for: ${url}`);
+  console.log(`Output path: ${outputPath}`);
+  console.log(`Method: ${method}`);
 
-    const timestamp = Date.now();
-    const outputFileName = `video_${timestamp}.mp4`;
-    const outputPath = path.join(tempDir, outputFileName);
-    const proxyUrl = `http://localhost:${PORT}/proxy?url=${encodeURIComponent(url)}`;
-
-    // Set headers for download
-    res.setHeader('Content-Disposition', `attachment; filename="${outputFileName}"`);
-    res.setHeader('Content-Type', 'video/mp4');
-
-    // Method 1: Try using FFmpeg if available
+  // Method 1: Try FFmpeg first (best quality)
+  if (method === 'auto' || method === 'ffmpeg') {
     try {
-      console.log('Attempting download with FFmpeg...');
-      await execPromise(`ffmpeg -i "${proxyUrl}" -c copy -bsf:a aac_adtstoasc "${outputPath}"`);
+      console.log('Attempting FFmpeg download...');
       
-      // Stream the file to client
-      const fileStream = fs.createReadStream(outputPath);
-      fileStream.pipe(res);
+      // Check if ffmpeg is available
+      try {
+        await execPromise('ffmpeg -version');
+      } catch (e) {
+        console.log('FFmpeg not available, trying next method');
+        if (method === 'ffmpeg') throw new Error('FFmpeg not available');
+      }
+
+      const proxyUrl = `http://localhost:${PORT}/proxy?url=${encodeURIComponent(url)}`;
       
-      // Clean up after streaming
-      fileStream.on('end', () => {
-        fs.unlink(outputPath, (err) => {
-          if (err) console.error('Error deleting temp file:', err);
+      // Use ffmpeg to download and convert
+      const ffmpeg = spawn('ffmpeg', [
+        '-i', proxyUrl,
+        '-c', 'copy',
+        '-bsf:a', 'aac_adtstoasc',
+        '-f', 'mp4',
+        '-y',
+        outputPath
+      ]);
+
+      let ffmpegError = '';
+
+      ffmpeg.stderr.on('data', (data) => {
+        const output = data.toString();
+        ffmpegError += output;
+        // Log progress
+        if (output.includes('time=')) {
+          const match = output.match(/time=(\d+:\d+:\d+\.\d+)/);
+          if (match) {
+            console.log(`FFmpeg progress: ${match[1]}`);
+          }
+        }
+      });
+
+      await new Promise((resolve, reject) => {
+        ffmpeg.on('close', (code) => {
+          if (code === 0) {
+            resolve();
+          } else {
+            reject(new Error(`FFmpeg exited with code ${code}: ${ffmpegError}`));
+          }
         });
       });
+
+      // Stream the file to client
+      const stat = fs.statSync(outputPath);
+      res.setHeader('Content-Length', stat.size);
+      res.setHeader('Content-Type', 'video/mp4');
+      res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
       
+      const fileStream = fs.createReadStream(outputPath);
+      await pipeline(fileStream, res);
+      
+      // Clean up
+      fs.unlink(outputPath, () => {});
+      
+      console.log(`FFmpeg download complete: ${fileName} (${(stat.size / 1024 / 1024).toFixed(2)} MB)`);
       return;
+      
     } catch (ffmpegError) {
-      console.log('FFmpeg not available, using alternative method...');
-    }
-
-    // Method 2: Manual HLS downloading and combining
-    console.log('Fetching master playlist...');
-    const playlistResponse = await axios.get(url, {
-      headers: {
-        "accept": "*/*",
-        "Referer": "https://appx-play.akamai.net.in/"
+      console.error('FFmpeg download failed:', ffmpegError.message);
+      if (method === 'ffmpeg') {
+        return res.status(500).json({ error: ffmpegError.message });
       }
-    });
+    }
+  }
 
-    const playlist = playlistResponse.data;
-    const baseUrl = url.substring(0, url.lastIndexOf('/') + 1);
-    
-    // Parse all segment URLs
-    const segmentLines = playlist.split('\n').filter(line => 
-      line && !line.startsWith('#') && line.trim().length > 0
-    );
-    
-    console.log(`Found ${segmentLines.length} segments to download`);
-
-    // Download all segments
-    const segments = [];
-    let totalSize = 0;
-    
-    for (let i = 0; i < segmentLines.length; i++) {
-      const segmentFile = segmentLines[i].trim();
-      const segmentUrl = segmentFile.startsWith('http') ? segmentFile : baseUrl + segmentFile;
+  // Method 2: Manual HLS download and concatenation
+  if (method === 'auto' || method === 'manual') {
+    try {
+      console.log('Attempting manual HLS download...');
       
-      console.log(`Downloading segment ${i + 1}/${segmentLines.length}...`);
-      
-      const segmentResponse = await axios.get(segmentUrl, {
+      // Fetch master playlist
+      const playlistResponse = await axios.get(url, {
         headers: {
           "accept": "*/*",
-          "Referer": "https://appx-play.akamai.net.in/"
+          "Referer": "https://appx-play.akamai.net.in/",
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
         },
-        responseType: 'arraybuffer'
+        timeout: 30000
       });
+
+      const playlist = playlistResponse.data;
+      const baseUrl = url.substring(0, url.lastIndexOf('/') + 1);
       
-      segments.push(Buffer.from(segmentResponse.data));
-      totalSize += segmentResponse.data.length;
+      // Parse segments
+      const segmentLines = playlist.split('\n')
+        .filter(line => line && !line.startsWith('#') && line.trim().length > 0)
+        .map(line => line.trim());
+      
+      console.log(`Found ${segmentLines.length} segments to download`);
+
+      if (segmentLines.length === 0) {
+        throw new Error('No segments found in playlist');
+      }
+
+      // Download segments in parallel with concurrency control
+      const CONCURRENT_DOWNLOADS = 5;
+      const segments = [];
+      let downloadedSize = 0;
+
+      for (let i = 0; i < segmentLines.length; i += CONCURRENT_DOWNLOADS) {
+        const batch = segmentLines.slice(i, i + CONCURRENT_DOWNLOADS);
+        const batchPromises = batch.map(async (segmentFile, index) => {
+          const segmentUrl = segmentFile.startsWith('http') ? segmentFile : baseUrl + segmentFile;
+          
+          try {
+            const response = await axios.get(segmentUrl, {
+              headers: {
+                "accept": "*/*",
+                "Referer": "https://appx-play.akamai.net.in/",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+              },
+              responseType: 'arraybuffer',
+              timeout: 30000
+            });
+            
+            const segmentData = Buffer.from(response.data);
+            downloadedSize += segmentData.length;
+            
+            console.log(`Downloaded segment ${i + index + 1}/${segmentLines.length} (${(downloadedSize / 1024 / 1024).toFixed(2)} MB)`);
+            
+            return segmentData;
+          } catch (err) {
+            console.error(`Failed to download segment ${i + index + 1}:`, err.message);
+            throw err;
+          }
+        });
+
+        const batchResults = await Promise.all(batchPromises);
+        segments.push(...batchResults);
+      }
+
+      // Combine all segments
+      console.log('Combining segments...');
+      const combinedBuffer = Buffer.concat(segments);
+      
+      // Write to file
+      fs.writeFileSync(outputPath, combinedBuffer);
+      
+      // Stream to client
+      const stat = fs.statSync(outputPath);
+      res.setHeader('Content-Length', stat.size);
+      res.setHeader('Content-Type', 'video/mp4');
+      res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+      
+      const fileStream = fs.createReadStream(outputPath);
+      await pipeline(fileStream, res);
+      
+      // Clean up
+      fs.unlink(outputPath, () => {});
+      
+      console.log(`Manual download complete: ${fileName} (${(stat.size / 1024 / 1024).toFixed(2)} MB)`);
+      return;
+      
+    } catch (manualError) {
+      console.error('Manual download failed:', manualError.message);
+      if (method === 'manual') {
+        return res.status(500).json({ error: manualError.message });
+      }
     }
-
-    // Combine all segments
-    console.log('Combining segments...');
-    const combinedBuffer = Buffer.concat(segments);
-    
-    console.log(`Download complete! Total size: ${(totalSize / (1024 * 1024)).toFixed(2)} MB`);
-
-    // Set content length and send
-    res.setHeader('Content-Length', combinedBuffer.length);
-    res.send(combinedBuffer);
-
-  } catch (err) {
-    console.error('Error downloading video:', err);
-    res.status(500).send('Download error: ' + err.message);
   }
+
+  // Method 3: Stream passthrough (if video is directly accessible)
+  if (method === 'auto' || method === 'direct') {
+    try {
+      console.log('Attempting direct stream download...');
+      
+      // Try to access the video directly
+      const response = await axios.get(url, {
+        headers: {
+          "accept": "*/*",
+          "Referer": "https://appx-play.akamai.net.in/",
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        },
+        responseType: 'stream',
+        timeout: 30000,
+        maxRedirects: 5
+      });
+
+      const contentType = response.headers['content-type'] || 'video/mp4';
+      const contentLength = response.headers['content-length'];
+
+      res.setHeader('Content-Type', contentType);
+      res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+      if (contentLength) {
+        res.setHeader('Content-Length', contentLength);
+      }
+
+      // Pipe directly to response
+      await pipeline(response.data, res);
+      
+      console.log('Direct stream download complete');
+      return;
+      
+    } catch (directError) {
+      console.error('Direct download failed:', directError.message);
+      if (method === 'direct') {
+        return res.status(500).json({ error: directError.message });
+      }
+    }
+  }
+
+  // If all methods fail
+  res.status(500).json({ 
+    error: 'All download methods failed',
+    message: 'Unable to download video. Please try again later.'
+  });
 });
 
-// Alternative download method using Python script
-app.get('/download-python', async (req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  const { url } = req.query;
-  
-  if (!url) {
-    return res.status(400).send('Missing url parameter');
-  }
-
-  try {
-    const timestamp = Date.now();
-    const outputFileName = `video_${timestamp}.mp4`;
-    
-    // Set headers for download
-    res.setHeader('Content-Disposition', `attachment; filename="${outputFileName}"`);
-    res.setHeader('Content-Type', 'video/mp4');
-
-    // Call Python script to download HLS stream
-    const pythonScript = `
-import m3u8
-import requests
-import sys
-from urllib.parse import urljoin
-
-def download_hls(master_url):
-    # Download master playlist
-    playlist = m3u8.load(master_url)
-    
-    # Get the highest quality stream
-    if playlist.playlists:
-        # Use the first variant (usually highest quality)
-        variant_url = urljoin(master_url, playlist.playlists[0].uri)
-        playlist = m3u8.load(variant_url)
-    
-    base_url = master_url[:master_url.rfind('/') + 1]
-    segments = []
-    
-    # Download all segments
-    for i, segment in enumerate(playlist.segments):
-        sys.stderr.write(f"Downloading segment {i + 1}/{len(playlist.segments)}\\n")
-        segment_url = urljoin(base_url, segment.uri)
-        response = requests.get(segment_url, headers={
-            'Referer': 'https://appx-play.akamai.net.in/'
-        })
-        sys.stdout.buffer.write(response.content)
-    
-    return len(playlist.segments)
-
-if __name__ == "__main__":
-    url = sys.argv[1]
-    total_segments = download_hls(url)
-    sys.stderr.write(f"Downloaded {total_segments} segments successfully\\n")
-    `;
-
-    // Execute Python script and pipe output to response
-    const { spawn } = require('child_process');
-    const pythonProcess = spawn('python3', ['-c', pythonScript, url]);
-    
-    pythonProcess.stdout.pipe(res);
-    
-    pythonProcess.stderr.on('data', (data) => {
-      console.log('Python:', data.toString());
-    });
-    
-    pythonProcess.on('close', (code) => {
-      console.log(`Python process exited with code ${code}`);
-    });
-
-  } catch (err) {
-    console.error('Error in Python download:', err);
-    res.status(500).send('Download error: ' + err.message);
-  }
-});
-
-// Web-based downloader that works in browser
-app.get('/web-download', async (req, res) => {
+// Web-based downloader with real-time progress
+app.get('/downloader', (req, res) => {
   const { url } = req.query;
   
   const html = `<!DOCTYPE html>
 <html>
 <head>
-  <title>HLS Video Downloader</title>
+  <title>Snow Player - Advanced Downloader</title>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
     body {
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
       background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
@@ -263,240 +353,428 @@ app.get('/web-download', async (req, res) => {
       display: flex;
       justify-content: center;
       align-items: center;
-      margin: 0;
       padding: 20px;
     }
+
     .container {
-      background: white;
-      border-radius: 20px;
+      background: rgba(255, 255, 255, 0.95);
+      backdrop-filter: blur(10px);
+      border-radius: 30px;
       padding: 40px;
-      box-shadow: 0 20px 60px rgba(0,0,0,0.3);
-      max-width: 600px;
+      box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+      max-width: 800px;
       width: 100%;
+      animation: slideUp 0.5s ease;
     }
+
+    @keyframes slideUp {
+      from {
+        opacity: 0;
+        transform: translateY(30px);
+      }
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
+    }
+
     h1 {
-      color: #333;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      font-size: 32px;
       margin-bottom: 10px;
-      font-size: 28px;
+      font-weight: 700;
     }
-    .url-display {
-      background: #f5f5f5;
-      padding: 15px;
-      border-radius: 10px;
-      word-break: break-all;
-      margin: 20px 0;
-      font-size: 14px;
+
+    .subtitle {
       color: #666;
+      margin-bottom: 30px;
+      font-size: 16px;
     }
+
+    .url-box {
+      background: #f7f7f7;
+      border-radius: 15px;
+      padding: 20px;
+      margin-bottom: 30px;
+      border: 1px solid #e0e0e0;
+      word-break: break-all;
+    }
+
+    .url-box label {
+      display: block;
+      color: #333;
+      font-weight: 600;
+      margin-bottom: 10px;
+      font-size: 14px;
+    }
+
+    .url-box .url {
+      color: #667eea;
+      font-size: 14px;
+      line-height: 1.5;
+    }
+
+    .method-selector {
+      margin-bottom: 30px;
+    }
+
+    .method-selector h3 {
+      color: #333;
+      margin-bottom: 15px;
+      font-size: 16px;
+    }
+
+    .method-buttons {
+      display: flex;
+      gap: 15px;
+      flex-wrap: wrap;
+    }
+
+    .method-btn {
+      background: white;
+      border: 2px solid #e0e0e0;
+      padding: 12px 24px;
+      border-radius: 30px;
+      cursor: pointer;
+      font-size: 14px;
+      font-weight: 600;
+      color: #666;
+      transition: all 0.3s;
+      flex: 1;
+      min-width: 120px;
+    }
+
+    .method-btn:hover {
+      border-color: #667eea;
+      color: #667eea;
+    }
+
+    .method-btn.active {
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      border-color: transparent;
+      color: white;
+    }
+
     .progress-container {
       margin: 30px 0;
     }
+
+    .progress-stats {
+      display: flex;
+      justify-content: space-between;
+      margin-bottom: 10px;
+      color: #666;
+      font-size: 14px;
+    }
+
     .progress-bar {
       width: 100%;
-      height: 30px;
+      height: 20px;
       background: #f0f0f0;
-      border-radius: 15px;
+      border-radius: 10px;
       overflow: hidden;
       position: relative;
     }
+
     .progress-fill {
       height: 100%;
       background: linear-gradient(90deg, #667eea, #764ba2);
       width: 0%;
       transition: width 0.3s ease;
+      position: relative;
+      overflow: hidden;
     }
-    .progress-text {
-      text-align: center;
-      margin-top: 10px;
-      font-size: 16px;
+
+    .progress-fill::after {
+      content: '';
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      background: linear-gradient(
+        90deg,
+        transparent,
+        rgba(255, 255, 255, 0.3),
+        transparent
+      );
+      animation: shimmer 2s infinite;
+    }
+
+    @keyframes shimmer {
+      0% { transform: translateX(-100%); }
+      100% { transform: translateX(100%); }
+    }
+
+    .status {
+      background: #f7f7f7;
+      border-radius: 15px;
+      padding: 20px;
+      margin: 20px 0;
+      border-left: 4px solid #667eea;
+    }
+
+    .status-item {
+      display: flex;
+      justify-content: space-between;
+      margin-bottom: 10px;
+      color: #333;
+      font-size: 14px;
+    }
+
+    .status-item:last-child {
+      margin-bottom: 0;
+    }
+
+    .status-item .label {
       color: #666;
     }
-    .status {
-      text-align: center;
-      padding: 15px;
-      border-radius: 10px;
-      margin: 20px 0;
-      font-weight: 500;
+
+    .status-item .value {
+      font-weight: 600;
+      color: #667eea;
     }
-    .status.downloading {
-      background: #e3f2fd;
-      color: #1976d2;
-    }
-    .status.completed {
-      background: #e8f5e9;
-      color: #388e3c;
-    }
-    .status.error {
-      background: #ffebee;
-      color: #d32f2f;
-    }
-    .button {
+
+    .download-btn {
       background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
       color: white;
       border: none;
-      padding: 15px 30px;
-      border-radius: 10px;
-      font-size: 16px;
+      padding: 18px 36px;
+      border-radius: 50px;
+      font-size: 18px;
       font-weight: 600;
       cursor: pointer;
       width: 100%;
-      transition: transform 0.2s;
+      transition: all 0.3s;
+      position: relative;
+      overflow: hidden;
     }
-    .button:hover {
+
+    .download-btn:hover {
       transform: translateY(-2px);
+      box-shadow: 0 10px 30px rgba(102, 126, 234, 0.4);
     }
-    .button:disabled {
-      opacity: 0.5;
+
+    .download-btn:disabled {
+      opacity: 0.6;
       cursor: not-allowed;
+      transform: none;
     }
-    .segment-info {
-      margin-top: 20px;
-      padding: 15px;
-      background: #f9f9f9;
+
+    .download-btn.loading::after {
+      content: '';
+      position: absolute;
+      top: 0;
+      left: -100%;
+      width: 100%;
+      height: 100%;
+      background: linear-gradient(
+        90deg,
+        transparent,
+        rgba(255, 255, 255, 0.3),
+        transparent
+      );
+      animation: btnShimmer 1.5s infinite;
+    }
+
+    @keyframes btnShimmer {
+      100% { left: 100%; }
+    }
+
+    .toast {
+      position: fixed;
+      top: 20px;
+      right: 20px;
+      background: white;
       border-radius: 10px;
-      font-size: 14px;
+      padding: 15px 25px;
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.2);
+      display: flex;
+      align-items: center;
+      gap: 15px;
+      transform: translateX(400px);
+      transition: transform 0.3s ease;
+      z-index: 1000;
+    }
+
+    .toast.show {
+      transform: translateX(0);
+    }
+
+    .toast.success {
+      border-left: 4px solid #10b981;
+    }
+
+    .toast.error {
+      border-left: 4px solid #ef4444;
+    }
+
+    .toast i {
+      font-size: 20px;
+    }
+
+    .toast.success i {
+      color: #10b981;
+    }
+
+    .toast.error i {
+      color: #ef4444;
+    }
+
+    .logs {
+      background: #1a1a1a;
+      color: #00ff00;
+      border-radius: 10px;
+      padding: 20px;
+      margin-top: 30px;
+      font-family: 'Courier New', monospace;
+      font-size: 12px;
+      max-height: 200px;
+      overflow-y: auto;
+    }
+
+    .log-entry {
+      margin-bottom: 5px;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+
+    .log-entry .time {
+      color: #888;
+      margin-right: 10px;
+    }
+
+    @media (max-width: 768px) {
+      .container {
+        padding: 20px;
+      }
+      
+      .method-buttons {
+        flex-direction: column;
+      }
+      
+      .method-btn {
+        width: 100%;
+      }
     }
   </style>
 </head>
 <body>
   <div class="container">
-    <h1>🎥 HLS Video Downloader</h1>
-    <p>Download complete HLS videos as MP4</p>
+    <h1>❄️ Snow Player Downloader</h1>
+    <p class="subtitle">Advanced HLS video downloader with multiple methods</p>
     
-    <div class="url-display">
-      <strong>Video URL:</strong><br>
-      ${url}
+    <div class="url-box">
+      <label>Video URL</label>
+      <div class="url" id="videoUrl">${url || 'No URL provided'}</div>
     </div>
-    
+
+    <div class="method-selector">
+      <h3>Download Method</h3>
+      <div class="method-buttons">
+        <button class="method-btn active" data-method="auto">🤖 Auto (Best)</button>
+        <button class="method-btn" data-method="ffmpeg">🎬 FFmpeg</button>
+        <button class="method-btn" data-method="manual">📦 Manual</button>
+        <button class="method-btn" data-method="direct">⚡ Direct</button>
+      </div>
+    </div>
+
     <div class="progress-container">
+      <div class="progress-stats">
+        <span id="progressPercent">0%</span>
+        <span id="progressSize">0 MB / 0 MB</span>
+      </div>
       <div class="progress-bar">
         <div class="progress-fill" id="progressFill"></div>
       </div>
-      <div class="progress-text" id="progressText">Ready to download</div>
     </div>
-    
-    <div class="status" id="status"></div>
-    
-    <div class="segment-info" id="segmentInfo">
-      <strong>Segments:</strong> <span id="segmentCount">0</span><br>
-      <strong>Total Size:</strong> <span id="totalSize">0 MB</span>
+
+    <div class="status">
+      <div class="status-item">
+        <span class="label">Status:</span>
+        <span class="value" id="statusText">Ready to download</span>
+      </div>
+      <div class="status-item">
+        <span class="label">Method:</span>
+        <span class="value" id="methodText">Auto</span>
+      </div>
+      <div class="status-item">
+        <span class="label">Segments:</span>
+        <span class="value" id="segmentsText">-</span>
+      </div>
+      <div class="status-item">
+        <span class="label">Speed:</span>
+        <span class="value" id="speedText">-</span>
+      </div>
+      <div class="status-item">
+        <span class="label">Time elapsed:</span>
+        <span class="value" id="timeText">-</span>
+      </div>
     </div>
-    
-    <button class="button" id="downloadBtn" onclick="startDownload()">
-      <i class="fas fa-download"></i> Download Complete Video
+
+    <button class="download-btn" id="downloadBtn" onclick="startDownload()">
+      <i class="fas fa-download"></i> Start Download
     </button>
+
+    <div class="logs" id="logs">
+      <div class="log-entry">
+        <span class="time">${new Date().toLocaleTimeString()}</span>
+        <span>Ready to download. Select method and click Start.</span>
+      </div>
+    </div>
   </div>
 
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/m3u8-parser/4.7.0/m3u8-parser.min.js"></script>
-  <script>
-    let segments = [];
-    let downloadedSegments = [];
-    let totalSize = 0;
-    let isDownloading = false;
+  <div class="toast" id="toast">
+    <i class="fas" id="toastIcon"></i>
+    <span id="toastMessage"></span>
+  </div>
 
-    async function startDownload() {
-      if (isDownloading) return;
-      
-      isDownloading = true;
-      const downloadBtn = document.getElementById('downloadBtn');
-      const status = document.getElementById('status');
-      const progressFill = document.getElementById('progressFill');
-      const progressText = document.getElementById('progressText');
-      const segmentCountSpan = document.getElementById('segmentCount');
-      const totalSizeSpan = document.getElementById('totalSize');
-      
-      downloadBtn.disabled = true;
-      status.className = 'status downloading';
-      status.innerHTML = '📥 Analyzing HLS stream...';
-      
-      try {
-        // Step 1: Fetch and parse master playlist
-        const masterResponse = await fetch('/proxy?url=' + encodeURIComponent('${url}'));
-        const masterPlaylist = await masterResponse.text();
-        
-        // Parse master playlist
-        const parser = new m3u8Parser.Parser();
-        parser.push(masterPlaylist);
-        parser.end();
-        const manifest = parser.manifest;
-        
-        // Get the highest quality stream
-        let playlistUrl = '${url}';
-        if (manifest.playlists && manifest.playlists.length > 0) {
-          // Use the first variant (usually highest quality)
-          const baseUrl = '${url}'.substring(0, '${url}'.lastIndexOf('/') + 1);
-          playlistUrl = baseUrl + manifest.playlists[0].uri;
-        }
-        
-        status.innerHTML = '📋 Downloading segment list...';
-        
-        // Step 2: Download segment list
-        const playlistResponse = await fetch('/proxy?url=' + encodeURIComponent(playlistUrl));
-        const playlistText = await playlistResponse.text();
-        
-        // Parse segments
-        const lines = playlistText.split('\\n');
-        segments = lines.filter(line => 
-          line && !line.startsWith('#') && line.trim().length > 0
-        );
-        
-        segmentCountSpan.textContent = segments.length;
-        
-        // Step 3: Download all segments
-        downloadedSegments = [];
-        totalSize = 0;
-        
-        for (let i = 0; i < segments.length; i++) {
-          status.innerHTML = 📥 Downloading segment ${i + 1}/${segments.length}...';
-          
-          // Get segment URL
-          const segmentFile = segments[i].trim();
-          const baseUrl = playlistUrl.substring(0, playlistUrl.lastIndexOf('/') + 1);
-          const segmentUrl = segmentFile.startsWith('http') ? segmentFile : baseUrl + segmentFile;
-          
-          // Download segment
-          const segmentResponse = await fetch('/segment?base=' + encodeURIComponent(baseUrl) + '&file=' + encodeURIComponent(segmentFile));
-          const segmentBlob = await segmentResponse.blob();
-          
-          downloadedSegments.push(segmentBlob);
-          totalSize += segmentBlob.size;
-          
-          // Update progress
-          const percent = ((i + 1) / segments.length * 100).toFixed(1);
-          progressFill.style.width = percent + '%';
-          progressText.textContent = percent + '% - ' + formatBytes(totalSize);
-          totalSizeSpan.textContent = formatBytes(totalSize);
-        }
-        
-        status.className = 'status completed';
-        status.innerHTML = '✅ All segments downloaded! Combining...';
-        
-        // Step 4: Combine all segments
-        const combinedBlob = new Blob(downloadedSegments, { type: 'video/mp4' });
-        
-        // Step 5: Trigger download
-        const downloadUrl = URL.createObjectURL(combinedBlob);
-        const a = document.createElement('a');
-        a.href = downloadUrl;
-        a.download = 'video_' + Date.now() + '.mp4';
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        URL.revokeObjectURL(downloadUrl);
-        
-        status.innerHTML = '✅ Download complete!';
-        progressText.textContent = 'Complete - ' + formatBytes(totalSize);
-        
-      } catch (error) {
-        console.error('Download error:', error);
-        status.className = 'status error';
-        status.innerHTML = '❌ Error: ' + error.message;
-      } finally {
-        isDownloading = false;
-        downloadBtn.disabled = false;
-      }
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+  
+  <script>
+    let selectedMethod = 'auto';
+    let startTime;
+    let lastLoaded = 0;
+    let speedInterval;
+
+    // Method selection
+    document.querySelectorAll('.method-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('.method-btn').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        selectedMethod = btn.dataset.method;
+        document.getElementById('methodText').textContent = 
+          btn.textContent.trim();
+        addLog(`Switched to ${btn.textContent.trim()} download method`);
+      });
+    });
+
+    function addLog(message, type = 'info') {
+      const logs = document.getElementById('logs');
+      const time = new Date().toLocaleTimeString();
+      const logEntry = document.createElement('div');
+      logEntry.className = 'log-entry';
+      logEntry.innerHTML = \`<span class="time">\${time}</span> \${message}\`;
+      logs.appendChild(logEntry);
+      logs.scrollTop = logs.scrollHeight;
     }
-    
+
+    function showToast(message, type = 'success') {
+      const toast = document.getElementById('toast');
+      const icon = document.getElementById('toastIcon');
+      const toastMessage = document.getElementById('toastMessage');
+      
+      toast.className = 'toast show ' + type;
+      icon.className = 'fas ' + (type === 'success' ? 'fa-check-circle' : 'fa-exclamation-circle');
+      toastMessage.textContent = message;
+      
+      setTimeout(() => {
+        toast.classList.remove('show');
+      }, 5000);
+    }
+
     function formatBytes(bytes) {
       if (bytes === 0) return '0 Bytes';
       const k = 1024;
@@ -504,16 +782,145 @@ app.get('/web-download', async (req, res) => {
       const i = Math.floor(Math.log(bytes) / Math.log(k));
       return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
     }
+
+    function formatTime(seconds) {
+      const hrs = Math.floor(seconds / 3600);
+      const mins = Math.floor((seconds % 3600) / 60);
+      const secs = Math.floor(seconds % 60);
+      
+      if (hrs > 0) {
+        return hrs + 'h ' + mins + 'm ' + secs + 's';
+      } else if (mins > 0) {
+        return mins + 'm ' + secs + 's';
+      } else {
+        return secs + 's';
+      }
+    }
+
+    async function startDownload() {
+      const url = new URLSearchParams(window.location.search).get('url');
+      if (!url) {
+        showToast('No URL provided', 'error');
+        return;
+      }
+
+      const downloadBtn = document.getElementById('downloadBtn');
+      const progressFill = document.getElementById('progressFill');
+      const progressPercent = document.getElementById('progressPercent');
+      const progressSize = document.getElementById('progressSize');
+      const statusText = document.getElementById('statusText');
+      const speedText = document.getElementById('speedText');
+      const timeText = document.getElementById('timeText');
+      
+      downloadBtn.disabled = true;
+      downloadBtn.classList.add('loading');
+      statusText.textContent = 'Downloading...';
+      startTime = Date.now();
+      lastLoaded = 0;
+      
+      addLog(\`Starting download with method: \${selectedMethod}\`);
+
+      try {
+        const response = await fetch('/download?url=' + encodeURIComponent(url) + '&method=' + selectedMethod);
+        
+        if (!response.ok) {
+          const error = await response.json();
+          throw new Error(error.message || 'Download failed');
+        }
+
+        const contentLength = response.headers.get('content-length');
+        const totalSize = contentLength ? parseInt(contentLength) : 0;
+        
+        if (totalSize > 0) {
+          progressSize.textContent = \`0 MB / \${(totalSize / 1024 / 1024).toFixed(2)} MB\`;
+        }
+
+        const reader = response.body.getReader();
+        const chunks = [];
+        let receivedLength = 0;
+
+        // Update speed every second
+        speedInterval = setInterval(() => {
+          const elapsed = (Date.now() - startTime) / 1000;
+          const speed = lastLoaded / elapsed;
+          speedText.textContent = formatBytes(speed) + '/s';
+          timeText.textContent = formatTime(elapsed);
+        }, 1000);
+
+        while (true) {
+          const { done, value } = await reader.read();
+          
+          if (done) {
+            break;
+          }
+          
+          chunks.push(value);
+          receivedLength += value.length;
+          lastLoaded = receivedLength;
+          
+          if (totalSize > 0) {
+            const percent = (receivedLength / totalSize * 100).toFixed(1);
+            progressFill.style.width = percent + '%';
+            progressPercent.textContent = percent + '%';
+            progressSize.textContent = \`\${(receivedLength / 1024 / 1024).toFixed(2)} MB / \${(totalSize / 1024 / 1024).toFixed(2)} MB\`;
+          } else {
+            // If no content-length, show downloaded size
+            progressSize.textContent = formatBytes(receivedLength);
+          }
+
+          // Update segments info if available
+          if (receivedLength > 0 && !totalSize) {
+            document.getElementById('segmentsText').textContent = 'Downloading...';
+          }
+        }
+
+        clearInterval(speedInterval);
+        
+        // Combine chunks and create download
+        const blob = new Blob(chunks, { type: 'video/mp4' });
+        const downloadUrl = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = downloadUrl;
+        a.download = 'snow_player_video_' + Date.now() + '.mp4';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(downloadUrl);
+
+        const elapsed = (Date.now() - startTime) / 1000;
+        statusText.textContent = 'Complete!';
+        progressPercent.textContent = '100%';
+        progressFill.style.width = '100%';
+        
+        addLog(\`Download complete! Size: \${formatBytes(receivedLength)} Time: \${formatTime(elapsed)}\`);
+        showToast(\`Download complete! (\${formatBytes(receivedLength)})\`, 'success');
+
+      } catch (error) {
+        console.error('Download error:', error);
+        statusText.textContent = 'Error: ' + error.message;
+        addLog(\`Error: \${error.message}\`, 'error');
+        showToast(error.message, 'error');
+        
+        clearInterval(speedInterval);
+      } finally {
+        downloadBtn.disabled = false;
+        downloadBtn.classList.remove('loading');
+      }
+    }
+
+    // Initialize
+    addLog('Downloader initialized');
+    if ('${url}') {
+      addLog('URL loaded: ' + '${url}'.substring(0, 50) + '...');
+    }
   </script>
-  
-  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
 </body>
 </html>`;
 
   res.send(html);
 });
 
-// Update player with download button pointing to web-download
+// Update player with download button
 app.get('/player', (req, res) => {
   const { url } = req.query;
   
@@ -640,8 +1047,8 @@ app.get('/player', (req, res) => {
             </div>
           </div>
 
-          <!-- Download Button - Opens web downloader -->
-          <button class="control-btn" id="download-btn" title="Download Video" onclick="window.open('/web-download?url=${encodeURIComponent(url)}', '_blank')">
+          <!-- Download Button -->
+          <button class="control-btn" id="download-btn" title="Download Video" onclick="window.open('/downloader?url=${encodeURIComponent(url)}', '_blank')">
             <i class="fas fa-download"></i>
           </button>
           
@@ -1099,8 +1506,19 @@ if (process.env.VERCEL) {
   module.exports = app;
 } else {
   app.listen(PORT, () => {
-    console.log(`Server running on http://localhost:${PORT}`);
+    console.log('=================================');
+    console.log('❄️ SNOW PLAYER - Professional Video Player');
+    console.log('=================================');
+    console.log(`Server: http://localhost:${PORT}`);
     console.log(`Player: http://localhost:${PORT}/player?url=YOUR_HLS_URL`);
-    console.log(`Downloader: http://localhost:${PORT}/web-download?url=YOUR_HLS_URL`);
+    console.log(`Downloader: http://localhost:${PORT}/downloader?url=YOUR_HLS_URL`);
+    console.log('=================================');
+    console.log('Features:');
+    console.log('• Multiple download methods (Auto/FFmpeg/Manual/Direct)');
+    console.log('• Real-time progress tracking');
+    console.log('• Download speed monitoring');
+    console.log('• Segment-by-segment download');
+    console.log('• Automatic fallback system');
+    console.log('=================================');
   });
 }
