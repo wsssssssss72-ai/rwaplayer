@@ -6,10 +6,10 @@ const app = express();
 app.use(cors());
 const PORT = process.env.PORT || 3000;
 
-// Proxy for .m3u8 playlists
+// Proxy for .m3u8 playlists with full segment resolution
 app.get('/proxy', async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  const { url } = req.query;
+  const { url, full = 'false' } = req.query;
   if (!url) return res.status(400).send('Missing url parameter');
 
   try {
@@ -19,15 +19,68 @@ app.get('/proxy', async (req, res) => {
         "Referer": "https://appx-play.akamai.net.in/",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
       },
-      timeout: 30000
+      timeout: 60000
     });
 
+    // If this is the master playlist and we need full resolution
+    if (full === 'true' && response.data.includes('#EXT-X-STREAM-INF')) {
+      // Find the highest quality stream
+      const lines = response.data.split('\n');
+      let bestUrl = null;
+      let bestBandwidth = 0;
+      
+      for (let i = 0; i < lines.length; i++) {
+        if (lines[i].startsWith('#EXT-X-STREAM-INF')) {
+          const bandwidth = parseInt(lines[i].match(/BANDWIDTH=(\d+)/)?.[1] || '0');
+          const nextLine = lines[i + 1]?.trim();
+          if (nextLine && !nextLine.startsWith('#')) {
+            if (bandwidth > bestBandwidth) {
+              bestBandwidth = bandwidth;
+              // Resolve relative URL
+              bestUrl = nextLine.startsWith('http') ? nextLine : 
+                       new URL(nextLine, url).href;
+            }
+          }
+        }
+      }
+      
+      if (bestUrl) {
+        // Fetch the best quality playlist
+        const bestResponse = await axios.get(bestUrl, {
+          headers: {
+            "accept": "*/*",
+            "Referer": "https://appx-play.akamai.net.in/",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+          }
+        });
+        
+        const base = bestUrl.substring(0, bestUrl.lastIndexOf('/') + 1);
+        let playlist = bestResponse.data;
+        
+        // Replace segment URLs with proxy URLs
+        playlist = playlist.replace(
+          /^(?!#)([^\r\n]+)$/gm,
+          (line) => {
+            if (line.startsWith('http') || line.startsWith('#')) return line;
+            // Encode the full segment URL
+            const segmentUrl = base + line;
+            return `/segment-proxy?url=${encodeURIComponent(segmentUrl)}`;
+          }
+        );
+        
+        res.setHeader('content-type', 'application/vnd.apple.mpegurl');
+        return res.send(playlist);
+      }
+    }
+    
+    // Regular playlist processing
     const base = url.substring(0, url.lastIndexOf('/') + 1);
     const playlist = response.data.replace(
       /^(?!#)([^\r\n]+)$/gm,
       (line) => {
         if (line.startsWith('http') || line.startsWith('#')) return line;
-        return `/segment?base=${encodeURIComponent(base)}&file=${encodeURIComponent(line)}`;
+        const segmentUrl = base + line;
+        return `/segment-proxy?url=${encodeURIComponent(segmentUrl)}`;
       }
     );
 
@@ -39,22 +92,21 @@ app.get('/proxy', async (req, res) => {
   }
 });
 
-// Proxy for .ts segments
-app.get('/segment', async (req, res) => {
+// Direct segment proxy
+app.get('/segment-proxy', async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  const { base, file } = req.query;
-  if (!base || !file) return res.status(400).send('Missing base or file parameter');
+  const { url } = req.query;
+  if (!url) return res.status(400).send('Missing url parameter');
 
-  const segmentUrl = base + file;
   try {
-    const response = await axios.get(segmentUrl, {
+    const response = await axios.get(decodeURIComponent(url), {
       headers: {
         "accept": "*/*",
         "Referer": "https://appx-play.akamai.net.in/",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
       },
       responseType: 'stream',
-      timeout: 30000
+      timeout: 60000
     });
 
     res.status(response.status);
@@ -64,227 +116,18 @@ app.get('/segment', async (req, res) => {
     response.data.pipe(res);
   } catch (err) {
     console.error('Error fetching segment:', err.message);
-    res.status(500).send('Proxy error: ' + err.message);
+    res.status(500).send('Segment error: ' + err.message);
   }
 });
 
-// PDF routes
-app.get('/pdf', async (req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  const { url } = req.query;
-  if (!url) return res.status(400).send('Missing url parameter');
-
-  try {
-    const forwardHeaders = {
-      accept: req.headers.accept || 'application/pdf,application/octet-stream,*/*',
-      referer: 'https://appx-play.akamai.net.in/',
-      'user-agent': req.headers['user-agent'] || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-    };
-
-    if (req.headers.range) {
-      forwardHeaders.Range = req.headers.range;
-    }
-
-    const upstream = await axios.get(url, {
-      headers: forwardHeaders,
-      responseType: 'stream',
-      validateStatus: status => status < 400
-    });
-
-    res.status(upstream.status);
-    const incomingHeaders = upstream.headers || {};
-    res.setHeader('content-type', incomingHeaders['content-type'] || 'application/pdf');
-    if (incomingHeaders['content-length']) res.setHeader('content-length', incomingHeaders['content-length']);
-    if (incomingHeaders['accept-ranges']) res.setHeader('accept-ranges', incomingHeaders['accept-ranges']);
-    if (incomingHeaders['content-range']) res.setHeader('content-range', incomingHeaders['content-range']);
-    res.setHeader('content-disposition', 'inline; filename="document.pdf"');
-    upstream.data.pipe(res);
-  } catch (err) {
-    console.error('Error fetching PDF:', err.message || err);
-    res.status(500).send('Proxy error: ' + (err.message || 'unknown error'));
-  }
-});
-
-app.get('/pdf-viewer', async (req, res) => {
-  const { url, dl = '0' } = req.query;
-  if (!url) return res.status(400).send('Missing url parameter');
-
-  try {
-    if (dl === '1') {
-      const upstream = await axios.get(url, {
-        headers: {
-          referer: 'https://appx-play.akamai.net.in/',
-          'user-agent': req.headers['user-agent'] || 'Mozilla/5.0'
-        },
-        responseType: 'stream'
-      });
-
-      res.setHeader('content-type', upstream.headers['content-type'] || 'application/pdf');
-      res.setHeader('content-disposition', `attachment; filename="document_${Date.now()}.pdf"`);
-      upstream.data.pipe(res);
-      return;
-    }
-
-    const encodedUrl = encodeURIComponent(url);
-    
-    const viewerHTML = `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Snow PDF Viewer</title>
-  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-  <style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0a0a0a; height: 100vh; display: flex; flex-direction: column; }
-    .toolbar { background: rgba(20,20,20,0.95); backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); border-bottom: 1px solid rgba(255,255,255,0.1); padding: 12px 20px; display: flex; align-items: center; gap: 15px; color: white; }
-    .toolbar button { background: transparent; border: none; color: rgba(255,255,255,0.7); width: 36px; height: 36px; border-radius: 8px; cursor: pointer; transition: all 0.2s; display: flex; align-items: center; justify-content: center; font-size: 16px; }
-    .toolbar button:hover { background: rgba(255,255,255,0.1); color: white; }
-    .toolbar .spacer { flex-grow: 1; }
-    .toolbar .page-info { font-size: 13px; color: rgba(255,255,255,0.5); padding: 0 10px; }
-    .toolbar .download-btn { background: #2a2a2a; width: auto; padding: 0 16px; border-radius: 8px; color: white; }
-    .toolbar .download-btn:hover { background: #3a3a3a; }
-    .viewer-container { flex: 1; overflow: auto; position: relative; background: #1a1a1a; display: flex; justify-content: center; align-items: flex-start; padding: 20px; }
-    #pdf-viewer { box-shadow: 0 5px 20px rgba(0,0,0,0.5); border-radius: 4px; max-width: 100%; }
-    .loading { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); color: white; font-size: 14px; background: rgba(0,0,0,0.7); padding: 12px 24px; border-radius: 30px; border: 1px solid rgba(255,255,255,0.1); }
-    .zoom-controls { display: flex; align-items: center; gap: 5px; background: rgba(255,255,255,0.05); padding: 3px; border-radius: 8px; }
-    .zoom-controls button { width: 32px; height: 32px; }
-    #zoom-reset { width: auto; padding: 0 12px; font-size: 12px; }
-  </style>
-</head>
-<body>
-  <div class="toolbar">
-    <button id="prev-page"><i class="fas fa-chevron-left"></i></button>
-    <button id="next-page"><i class="fas fa-chevron-right"></i></button>
-    <span class="page-info">Page <span id="page-num">1</span> of <span id="page-count">0</span></span>
-    
-    <div class="zoom-controls">
-      <button id="zoom-out"><i class="fas fa-search-minus"></i></button>
-      <button id="zoom-reset">100%</button>
-      <button id="zoom-in"><i class="fas fa-search-plus"></i></button>
-    </div>
-    
-    <div class="spacer"></div>
-    
-    <button class="download-btn" id="download"><i class="fas fa-download"></i> Download</button>
-  </div>
-  
-  <div class="viewer-container">
-    <div class="loading">Loading PDF...</div>
-    <canvas id="pdf-viewer"></canvas>
-  </div>
-
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.4.120/pdf.min.js"></script>
-  <script>
-    pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.4.120/pdf.worker.min.js';
-    
-    let pdfDoc = null, pageNum = 1, pageRendering = false, pageNumPending = null, scale = 1.0;
-    const canvas = document.getElementById('pdf-viewer');
-    const ctx = canvas.getContext('2d');
-    
-    function initPDFViewer() {
-      const pdfUrl = decodeURIComponent("${encodedUrl}");
-      
-      const loadingTask = pdfjsLib.getDocument({
-        url: '/pdf?url=' + encodeURIComponent(pdfUrl),
-        withCredentials: false,
-        httpHeaders: { 'Referer': 'https://appx-play.akamai.net.in/', 'User-Agent': navigator.userAgent }
-      });
-      
-      loadingTask.promise.then(function(pdf) {
-        pdfDoc = pdf;
-        document.getElementById('page-count').textContent = pdf.numPages;
-        renderPage(pageNum);
-      }).catch(function(err) {
-        document.querySelector('.loading').innerHTML = 'Error loading PDF';
-      });
-    }
-    
-    function renderPage(num) {
-      pageRendering = true;
-      document.querySelector('.loading').style.display = 'block';
-      
-      const dpr = window.devicePixelRatio || 1;
-      const container = canvas.parentElement;
-      
-      pdfDoc.getPage(num).then(function(page) {
-        const viewport = page.getViewport({ scale: 1.0 });
-        const containerWidth = container.clientWidth - 40;
-        const containerHeight = container.clientHeight - 40;
-        
-        scale = Math.min(containerWidth / viewport.width, containerHeight / viewport.height, 2.0);
-        if (scale < 0.5) scale = 0.5;
-        
-        const scaledViewport = page.getViewport({ scale: scale * dpr });
-        
-        canvas.width = scaledViewport.width;
-        canvas.height = scaledViewport.height;
-        canvas.style.width = (scaledViewport.width / dpr) + 'px';
-        canvas.style.height = (scaledViewport.height / dpr) + 'px';
-        
-        const renderContext = {
-          canvasContext: ctx,
-          viewport: scaledViewport
-        };
-        
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
-        
-        const renderTask = page.render(renderContext);
-        renderTask.promise.then(function() {
-          pageRendering = false;
-          document.querySelector('.loading').style.display = 'none';
-          if (pageNumPending !== null) {
-            renderPage(pageNumPending);
-            pageNumPending = null;
-          }
-        });
-      });
-      
-      document.getElementById('page-num').textContent = num;
-      document.getElementById('zoom-reset').textContent = Math.round(scale * 100) + '%';
-    }
-
-    function queueRenderPage(num) {
-      if (pageRendering) pageNumPending = num;
-      else renderPage(num);
-    }
-    
-    function prevPage() { if (pageNum <= 1) return; pageNum--; queueRenderPage(pageNum); }
-    function nextPage() { if (pageNum >= pdfDoc.numPages) return; pageNum++; queueRenderPage(pageNum); }
-    function zoomIn() { scale = Math.min(scale * 1.2, 3.0); queueRenderPage(pageNum); }
-    function zoomOut() { scale = Math.max(scale / 1.2, 0.5); queueRenderPage(pageNum); }
-    function zoomReset() { scale = 1.0; queueRenderPage(pageNum); }
-    
-    document.getElementById('prev-page').addEventListener('click', prevPage);
-    document.getElementById('next-page').addEventListener('click', nextPage);
-    document.getElementById('zoom-in').addEventListener('click', zoomIn);
-    document.getElementById('zoom-out').addEventListener('click', zoomOut);
-    document.getElementById('zoom-reset').addEventListener('click', zoomReset);
-    document.getElementById('download').addEventListener('click', () => {
-      window.location.href = window.location.pathname + '?url=${encodedUrl}&dl=1';
-    });
-    
-    window.addEventListener('load', initPDFViewer);
-    window.addEventListener('resize', () => { if (pdfDoc) queueRenderPage(pageNum); });
-  </script>
-</body>
-</html>`;
-
-    res.setHeader('content-type', 'text/html');
-    res.send(viewerHTML);
-  } catch (err) {
-    res.status(500).send('Error loading PDF viewer');
-  }
-});
-
-// BROWSER-BASED HLS DOWNLOADER - Works in serverless environments
+// Advanced downloader that properly handles HLS streams
 app.get('/downloader', (req, res) => {
   const { url } = req.query;
   
   const html = `<!DOCTYPE html>
 <html>
 <head>
-  <title>Snow Player - HLS Downloader</title>
+  <title>Snow Player - Advanced HLS Downloader</title>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <style>
@@ -298,32 +141,21 @@ app.get('/downloader', (req, res) => {
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
       background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
       min-height: 100vh;
-      display: flex;
-      justify-content: center;
-      align-items: center;
       padding: 20px;
     }
 
     .container {
-      background: rgba(255, 255, 255, 0.95);
-      backdrop-filter: blur(10px);
-      border-radius: 30px;
-      padding: 40px;
-      box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
-      max-width: 900px;
-      width: 100%;
-      animation: slideUp 0.5s ease;
+      max-width: 1200px;
+      margin: 0 auto;
     }
 
-    @keyframes slideUp {
-      from {
-        opacity: 0;
-        transform: translateY(30px);
-      }
-      to {
-        opacity: 1;
-        transform: translateY(0);
-      }
+    .header {
+      background: rgba(255, 255, 255, 0.95);
+      backdrop-filter: blur(10px);
+      border-radius: 20px;
+      padding: 30px;
+      margin-bottom: 20px;
+      box-shadow: 0 20px 40px rgba(0,0,0,0.2);
     }
 
     h1 {
@@ -332,75 +164,88 @@ app.get('/downloader', (req, res) => {
       -webkit-text-fill-color: transparent;
       font-size: 36px;
       margin-bottom: 10px;
-      font-weight: 700;
-    }
-
-    .subtitle {
-      color: #666;
-      margin-bottom: 30px;
-      font-size: 16px;
     }
 
     .url-box {
-      background: #f7f7f7;
-      border-radius: 15px;
+      background: #f5f5f5;
+      border-radius: 12px;
       padding: 20px;
-      margin-bottom: 30px;
-      border: 1px solid #e0e0e0;
+      margin: 20px 0;
       word-break: break-all;
+      border: 1px solid #e0e0e0;
     }
 
-    .url-box label {
-      display: block;
-      color: #333;
+    .quality-selector {
+      display: flex;
+      gap: 15px;
+      margin: 20px 0;
+      flex-wrap: wrap;
+    }
+
+    .quality-btn {
+      background: white;
+      border: 2px solid #e0e0e0;
+      padding: 15px 30px;
+      border-radius: 12px;
+      cursor: pointer;
+      font-size: 16px;
       font-weight: 600;
-      margin-bottom: 10px;
-      font-size: 14px;
+      color: #333;
+      transition: all 0.3s;
+      flex: 1;
+      min-width: 150px;
     }
 
-    .url-box .url {
+    .quality-btn:hover {
+      border-color: #667eea;
       color: #667eea;
-      font-size: 14px;
-      line-height: 1.5;
+    }
+
+    .quality-btn.active {
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      border-color: transparent;
+      color: white;
     }
 
     .stats-grid {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
       gap: 20px;
-      margin-bottom: 30px;
+      margin: 30px 0;
     }
 
     .stat-card {
-      background: #f7f7f7;
+      background: white;
       border-radius: 15px;
-      padding: 20px;
+      padding: 25px;
       text-align: center;
-      border: 1px solid #e0e0e0;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.1);
       transition: transform 0.3s;
     }
 
     .stat-card:hover {
       transform: translateY(-5px);
-      box-shadow: 0 10px 30px rgba(102, 126, 234, 0.2);
     }
 
     .stat-value {
-      font-size: 24px;
+      font-size: 32px;
       font-weight: 700;
       color: #667eea;
-      margin-bottom: 5px;
+      margin-bottom: 10px;
     }
 
     .stat-label {
       color: #666;
-      font-size: 13px;
+      font-size: 14px;
       text-transform: uppercase;
       letter-spacing: 1px;
     }
 
-    .progress-container {
-      margin: 30px 0;
+    .progress-section {
+      background: white;
+      border-radius: 15px;
+      padding: 30px;
+      margin: 20px 0;
     }
 
     .progress-bar {
@@ -409,8 +254,8 @@ app.get('/downloader', (req, res) => {
       background: #f0f0f0;
       border-radius: 15px;
       overflow: hidden;
+      margin: 20px 0;
       position: relative;
-      box-shadow: inset 0 2px 5px rgba(0,0,0,0.1);
     }
 
     .progress-fill {
@@ -443,66 +288,83 @@ app.get('/downloader', (req, res) => {
       100% { transform: translateX(100%); }
     }
 
-    .progress-text {
-      text-align: center;
-      margin-top: 10px;
-      font-size: 14px;
-      color: #666;
-    }
-
-    .segments-container {
+    .segment-list {
       background: #1a1a1a;
       border-radius: 15px;
       padding: 20px;
       margin: 20px 0;
-      max-height: 300px;
+      max-height: 400px;
       overflow-y: auto;
-      font-family: 'Courier New', monospace;
     }
 
     .segment-item {
-      padding: 8px;
-      margin: 5px 0;
-      border-radius: 5px;
       background: rgba(255,255,255,0.05);
-      color: #00ff00;
-      font-size: 12px;
+      border-radius: 8px;
+      padding: 12px;
+      margin: 8px 0;
       display: flex;
       justify-content: space-between;
-      animation: fadeIn 0.3s ease;
-    }
-
-    @keyframes fadeIn {
-      from { opacity: 0; transform: translateX(-10px); }
-      to { opacity: 1; transform: translateX(0); }
+      align-items: center;
+      color: #00ff00;
+      font-family: monospace;
+      transition: all 0.3s;
     }
 
     .segment-item.downloaded {
       background: rgba(0, 255, 0, 0.1);
-      color: #00ff00;
+      border-left: 4px solid #00ff00;
     }
 
     .segment-item .index {
       color: #888;
-      margin-right: 10px;
+      margin-right: 15px;
     }
 
     .segment-item .size {
       color: #667eea;
+      font-weight: 600;
+    }
+
+    .segment-item .status {
+      padding: 4px 12px;
+      border-radius: 20px;
+      font-size: 12px;
+      font-weight: 600;
+    }
+
+    .status.pending {
+      background: #f39c12;
+      color: white;
+    }
+
+    .status.downloading {
+      background: #3498db;
+      color: white;
+      animation: pulse 1s infinite;
+    }
+
+    .status.completed {
+      background: #2ecc71;
+      color: white;
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.7; }
     }
 
     .download-btn {
       background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
       color: white;
       border: none;
-      padding: 18px 36px;
+      padding: 20px 40px;
       border-radius: 50px;
-      font-size: 18px;
+      font-size: 20px;
       font-weight: 600;
       cursor: pointer;
       width: 100%;
       transition: all 0.3s;
-      margin-top: 20px;
+      margin: 20px 0;
       position: relative;
       overflow: hidden;
     }
@@ -518,34 +380,14 @@ app.get('/downloader', (req, res) => {
       transform: none;
     }
 
-    .download-btn.loading::after {
-      content: '';
-      position: absolute;
-      top: 0;
-      left: -100%;
-      width: 100%;
-      height: 100%;
-      background: linear-gradient(
-        90deg,
-        transparent,
-        rgba(255, 255, 255, 0.3),
-        transparent
-      );
-      animation: btnShimmer 1.5s infinite;
-    }
-
-    @keyframes btnShimmer {
-      100% { left: 100%; }
-    }
-
     .toast {
       position: fixed;
       top: 20px;
       right: 20px;
       background: white;
-      border-radius: 10px;
-      padding: 15px 25px;
-      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.2);
+      border-radius: 12px;
+      padding: 16px 24px;
+      box-shadow: 0 10px 40px rgba(0,0,0,0.2);
       display: flex;
       align-items: center;
       gap: 15px;
@@ -559,45 +401,62 @@ app.get('/downloader', (req, res) => {
     }
 
     .toast.success {
-      border-left: 4px solid #10b981;
+      border-left: 4px solid #2ecc71;
     }
 
     .toast.error {
-      border-left: 4px solid #ef4444;
+      border-left: 4px solid #e74c3c;
     }
 
     .toast i {
-      font-size: 20px;
+      font-size: 24px;
     }
 
     .toast.success i {
-      color: #10b981;
+      color: #2ecc71;
     }
 
     .toast.error i {
-      color: #ef4444;
+      color: #e74c3c;
     }
 
-    .info-text {
-      text-align: center;
-      color: #666;
-      font-size: 14px;
-      margin-top: 20px;
-      padding: 15px;
-      background: #f7f7f7;
-      border-radius: 10px;
+    .info-panel {
+      background: #f8f9fa;
+      border-radius: 12px;
+      padding: 20px;
+      margin: 20px 0;
       border: 1px solid #e0e0e0;
+    }
+
+    .info-panel h3 {
+      color: #333;
+      margin-bottom: 15px;
+    }
+
+    .info-panel p {
+      color: #666;
+      line-height: 1.6;
     }
   </style>
 </head>
 <body>
   <div class="container">
-    <h1>❄️ Snow Player Downloader</h1>
-    <p class="subtitle">Browser-based HLS video downloader - No server processing needed</p>
-    
-    <div class="url-box">
-      <label>Video URL</label>
-      <div class="url" id="videoUrl">${url || 'No URL provided'}</div>
+    <div class="header">
+      <h1>❄️ Snow Player Advanced Downloader</h1>
+      <p style="color: #666;">Professional HLS video downloader with quality selection</p>
+      
+      <div class="url-box">
+        <strong style="display: block; margin-bottom: 10px; color: #333;">Video URL:</strong>
+        <div style="color: #667eea; font-size: 14px; word-break: break-all;" id="videoUrl">${url || 'No URL provided'}</div>
+      </div>
+
+      <div class="quality-selector" id="qualitySelector">
+        <button class="quality-btn active" onclick="selectQuality('auto')">🤖 Auto (Best)</button>
+        <button class="quality-btn" onclick="selectQuality('1080p')">📺 1080p</button>
+        <button class="quality-btn" onclick="selectQuality('720p')">📺 720p</button>
+        <button class="quality-btn" onclick="selectQuality('480p')">📺 480p</button>
+        <button class="quality-btn" onclick="selectQuality('360p')">📺 360p</button>
+      </div>
     </div>
 
     <div class="stats-grid">
@@ -617,18 +476,25 @@ app.get('/downloader', (req, res) => {
         <div class="stat-value" id="downloadSpeed">0 MB/s</div>
         <div class="stat-label">Speed</div>
       </div>
+      <div class="stat-card">
+        <div class="stat-value" id="timeRemaining">--:--</div>
+        <div class="stat-label">Time Left</div>
+      </div>
     </div>
 
-    <div class="progress-container">
+    <div class="progress-section">
+      <div style="display: flex; justify-content: space-between; margin-bottom: 10px;">
+        <span style="font-weight: 600;" id="progressPercent">0%</span>
+        <span style="color: #666;" id="progressDetails">0 of 0 segments</span>
+      </div>
       <div class="progress-bar">
         <div class="progress-fill" id="progressFill"></div>
       </div>
-      <div class="progress-text" id="progressText">0% Complete</div>
     </div>
 
-    <div class="segments-container" id="segmentsContainer">
+    <div class="segment-list" id="segmentList">
       <div class="segment-item">
-        <span>Waiting for playlist...</span>
+        <span>Loading playlist...</span>
       </div>
     </div>
 
@@ -636,10 +502,12 @@ app.get('/downloader', (req, res) => {
       <i class="fas fa-download"></i> Start Download
     </button>
 
-    <div class="info-text">
-      <i class="fas fa-info-circle"></i> 
-      This downloader works entirely in your browser. Segments are downloaded and combined locally.
-      Large videos may take time and memory based on your connection.
+    <div class="info-panel">
+      <h3>📋 Download Information</h3>
+      <p>• This downloader processes the complete HLS stream by downloading all segments</p>
+      <p>• The video will be fully downloaded and combined into a single MP4 file</p>
+      <p>• Download speed depends on your internet connection and server response</p>
+      <p>• Large videos may take several minutes - please be patient</p>
     </div>
   </div>
 
@@ -651,13 +519,19 @@ app.get('/downloader', (req, res) => {
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
   
   <script>
+    // State management
     let segments = [];
     let downloadedData = [];
+    let segmentSizes = [];
     let totalSize = 0;
     let startTime = null;
     let speedInterval = null;
     let isDownloading = false;
+    let selectedQuality = 'auto';
+    let masterPlaylist = null;
+    let qualityLevels = [];
 
+    // Show toast notification
     function showToast(message, type = 'success') {
       const toast = document.getElementById('toast');
       const icon = document.getElementById('toastIcon');
@@ -672,6 +546,7 @@ app.get('/downloader', (req, res) => {
       }, 5000);
     }
 
+    // Format bytes to human readable
     function formatBytes(bytes) {
       if (bytes === 0) return '0 Bytes';
       const k = 1024;
@@ -680,84 +555,205 @@ app.get('/downloader', (req, res) => {
       return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
     }
 
-    function updateStats() {
-      document.getElementById('totalSegments').textContent = segments.length;
-      document.getElementById('downloadedSegments').textContent = downloadedData.length;
-      document.getElementById('totalSize').textContent = formatBytes(totalSize);
+    // Format time
+    function formatTime(seconds) {
+      if (!seconds || seconds < 0) return '--:--';
+      const hrs = Math.floor(seconds / 3600);
+      const mins = Math.floor((seconds % 3600) / 60);
+      const secs = Math.floor(seconds % 60);
       
-      const percent = segments.length > 0 ? (downloadedData.length / segments.length * 100).toFixed(1) : 0;
-      document.getElementById('progressFill').style.width = percent + '%';
-      document.getElementById('progressText').textContent = percent + '% Complete';
-      
-      if (startTime && downloadedData.length > 0) {
-        const elapsed = (Date.now() - startTime) / 1000;
-        const speed = totalSize / elapsed;
-        document.getElementById('downloadSpeed').textContent = (speed / 1024 / 1024).toFixed(2) + ' MB/s';
+      if (hrs > 0) {
+        return hrs + ':' + (mins < 10 ? '0' : '') + mins + ':' + (secs < 10 ? '0' : '') + secs;
+      } else {
+        return mins + ':' + (secs < 10 ? '0' : '') + secs;
       }
     }
 
-    async function fetchPlaylist(url) {
+    // Update statistics
+    function updateStats() {
+      const downloadedCount = downloadedData.length;
+      const percent = segments.length > 0 ? (downloadedCount / segments.length * 100).toFixed(1) : 0;
+      
+      document.getElementById('totalSegments').textContent = segments.length;
+      document.getElementById('downloadedSegments').textContent = downloadedCount;
+      document.getElementById('totalSize').textContent = formatBytes(totalSize);
+      document.getElementById('progressPercent').textContent = percent + '%';
+      document.getElementById('progressDetails').textContent = \`\${downloadedCount} of \${segments.length} segments\`;
+      document.getElementById('progressFill').style.width = percent + '%';
+      
+      if (startTime && downloadedCount > 0) {
+        const elapsed = (Date.now() - startTime) / 1000;
+        const speed = totalSize / elapsed;
+        document.getElementById('downloadSpeed').textContent = (speed / 1024 / 1024).toFixed(2) + ' MB/s';
+        
+        if (segments.length > downloadedCount) {
+          const remainingSegments = segments.length - downloadedCount;
+          const avgSegmentSize = totalSize / downloadedCount;
+          const remainingBytes = remainingSegments * avgSegmentSize;
+          const remainingTime = remainingBytes / speed;
+          document.getElementById('timeRemaining').textContent = formatTime(remainingTime);
+        }
+      }
+    }
+
+    // Parse master playlist to get quality levels
+    async function parseMasterPlaylist(url) {
       try {
         const response = await fetch('/proxy?url=' + encodeURIComponent(url));
         const playlist = await response.text();
         
+        masterPlaylist = playlist;
+        const lines = playlist.split('\n');
+        const qualities = [];
+        
+        for (let i = 0; i < lines.length; i++) {
+          if (lines[i].startsWith('#EXT-X-STREAM-INF')) {
+            const resolution = lines[i].match(/RESOLUTION=(\d+x\d+)/)?.[1];
+            const bandwidth = lines[i].match(/BANDWIDTH=(\d+)/)?.[1];
+            const name = lines[i].match(/NAME="([^"]+)"/)?.[1];
+            const nextLine = lines[i + 1]?.trim();
+            
+            if (nextLine && !nextLine.startsWith('#')) {
+              qualities.push({
+                resolution: resolution || 'unknown',
+                bandwidth: parseInt(bandwidth || '0'),
+                name: name || (resolution ? resolution.split('x')[1] + 'p' : 'auto'),
+                url: nextLine.startsWith('http') ? nextLine : new URL(nextLine, url).href
+              });
+            }
+          }
+        }
+        
+        qualityLevels = qualities.sort((a, b) => b.bandwidth - a.bandwidth);
+        
+        // Update quality selector with available qualities
+        const selector = document.getElementById('qualitySelector');
+        selector.innerHTML = '<button class="quality-btn active" onclick="selectQuality(\'auto\')">🤖 Auto (Best)</button>';
+        
+        qualityLevels.forEach(q => {
+          const btn = document.createElement('button');
+          btn.className = 'quality-btn';
+          btn.setAttribute('onclick', \`selectQuality('\${q.url}')\`);
+          btn.textContent = \`📺 \${q.name} (\${(q.bandwidth/1000000).toFixed(1)} Mbps)\`;
+          selector.appendChild(btn);
+        });
+        
+        return qualityLevels;
+      } catch (error) {
+        console.error('Error parsing master playlist:', error);
+        return [];
+      }
+    }
+
+    // Select quality
+    function selectQuality(quality) {
+      document.querySelectorAll('.quality-btn').forEach(btn => btn.classList.remove('active'));
+      event.target.classList.add('active');
+      selectedQuality = quality;
+      showToast('Quality selected: ' + quality, 'success');
+    }
+
+    // Fetch segments for selected quality
+    async function fetchSegments() {
+      const urlParams = new URLSearchParams(window.location.search);
+      const baseUrl = urlParams.get('url');
+      
+      let playlistUrl = baseUrl;
+      
+      // If auto mode and we have quality levels, use the highest
+      if (selectedQuality === 'auto' && qualityLevels.length > 0) {
+        playlistUrl = qualityLevels[0].url;
+      } else if (selectedQuality !== 'auto') {
+        playlistUrl = selectedQuality;
+      }
+      
+      try {
+        const response = await fetch('/proxy?url=' + encodeURIComponent(playlistUrl) + '&full=true');
+        const playlist = await response.text();
+        
         // Parse segments
-        const lines = playlist.split('\\n');
+        const lines = playlist.split('\n');
         segments = lines.filter(line => 
           line && !line.startsWith('#') && line.trim().length > 0
-        ).map(line => line.trim());
-        
-        // Get base URL
-        const baseUrl = url.substring(0, url.lastIndexOf('/') + 1);
+        ).map(line => {
+          // Extract the actual segment URL from the proxy URL
+          const match = line.match(/url=([^&]+)/);
+          return match ? decodeURIComponent(match[1]) : line;
+        });
         
         // Update UI
-        const container = document.getElementById('segmentsContainer');
-        container.innerHTML = '';
+        const listContainer = document.getElementById('segmentList');
+        listContainer.innerHTML = '';
         
         segments.forEach((segment, index) => {
-          const segmentDiv = document.createElement('div');
-          segmentDiv.className = 'segment-item';
-          segmentDiv.id = \`segment-\${index}\`;
-          segmentDiv.innerHTML = \`
-            <span>
+          const item = document.createElement('div');
+          item.className = 'segment-item';
+          item.id = \`segment-\${index}\`;
+          item.innerHTML = \`
+            <div>
               <span class="index">#\${index + 1}</span>
-              \${segment.substring(0, 30)}...
-            </span>
-            <span class="size">Pending</span>
+              <span>Segment \${index + 1} of \${segments.length}</span>
+            </div>
+            <div>
+              <span class="size">-</span>
+              <span class="status pending">Pending</span>
+            </div>
           \`;
-          container.appendChild(segmentDiv);
+          listContainer.appendChild(item);
         });
         
         document.getElementById('totalSegments').textContent = segments.length;
         showToast(\`Found \${segments.length} segments\`, 'success');
         
-        return { segments, baseUrl };
+        return segments;
       } catch (error) {
-        console.error('Error fetching playlist:', error);
-        showToast('Error fetching playlist: ' + error.message, 'error');
+        console.error('Error fetching segments:', error);
+        showToast('Error fetching segments: ' + error.message, 'error');
         throw error;
       }
     }
 
-    async function downloadSegment(url, index) {
+    // Download a single segment
+    async function downloadSegment(segmentUrl, index) {
       try {
-        const response = await fetch('/segment?base=' + encodeURIComponent(url.substring(0, url.lastIndexOf('/') + 1)) + '&file=' + encodeURIComponent(url.split('/').pop()));
-        const blob = await response.blob();
-        
-        const segmentDiv = document.getElementById(\`segment-\${index}\`);
-        if (segmentDiv) {
-          segmentDiv.className = 'segment-item downloaded';
-          segmentDiv.querySelector('.size').textContent = formatBytes(blob.size);
+        // Update status to downloading
+        const item = document.getElementById(\`segment-\${index}\`);
+        if (item) {
+          const statusSpan = item.querySelector('.status');
+          statusSpan.className = 'status downloading';
+          statusSpan.textContent = 'Downloading';
         }
         
+        // Download segment through proxy
+        const response = await fetch('/segment-proxy?url=' + encodeURIComponent(segmentUrl));
+        const blob = await response.blob();
+        
+        // Update UI
+        if (item) {
+          const statusSpan = item.querySelector('.status');
+          const sizeSpan = item.querySelector('.size');
+          statusSpan.className = 'status completed';
+          statusSpan.textContent = 'Completed';
+          sizeSpan.textContent = formatBytes(blob.size);
+        }
+        
+        segmentSizes[index] = blob.size;
         return blob;
       } catch (error) {
         console.error(\`Error downloading segment \${index + 1}:\`, error);
-        showToast(\`Error downloading segment \${index + 1}\`, 'error');
+        
+        const item = document.getElementById(\`segment-\${index}\`);
+        if (item) {
+          const statusSpan = item.querySelector('.status');
+          statusSpan.className = 'status pending';
+          statusSpan.textContent = 'Failed - Retry';
+        }
+        
         throw error;
       }
     }
 
+    // Main download function
     async function startDownload() {
       if (isDownloading) return;
       
@@ -771,38 +767,53 @@ app.get('/downloader', (req, res) => {
 
       const downloadBtn = document.getElementById('downloadBtn');
       downloadBtn.disabled = true;
-      downloadBtn.classList.add('loading');
       downloadBtn.innerHTML = '<i class="fas fa-circle-notch fa-spin"></i> Downloading...';
       
       isDownloading = true;
       downloadedData = [];
+      segmentSizes = [];
       totalSize = 0;
       startTime = Date.now();
 
       try {
-        // Fetch playlist
-        showToast('Fetching playlist...', 'success');
-        const { segments, baseUrl } = await fetchPlaylist(videoUrl);
+        // Parse master playlist first
+        showToast('Analyzing video streams...', 'success');
+        await parseMasterPlaylist(videoUrl);
+        
+        // Fetch segments for selected quality
+        await fetchSegments();
         
         if (segments.length === 0) {
-          throw new Error('No segments found in playlist');
+          throw new Error('No segments found');
         }
 
-        // Download segments sequentially
+        // Download segments with retry logic
         for (let i = 0; i < segments.length; i++) {
-          const segmentUrl = segments[i].startsWith('http') ? segments[i] : baseUrl + segments[i];
-          const blob = await downloadSegment(segmentUrl, i);
+          let retries = 3;
+          let success = false;
           
-          downloadedData.push(blob);
-          totalSize += blob.size;
-          updateStats();
+          while (retries > 0 && !success) {
+            try {
+              const blob = await downloadSegment(segments[i], i);
+              downloadedData.push(blob);
+              totalSize += blob.size;
+              updateStats();
+              success = true;
+            } catch (error) {
+              retries--;
+              if (retries === 0) {
+                throw new Error(\`Failed to download segment \${i + 1} after 3 retries\`);
+              }
+              await new Promise(resolve => setTimeout(resolve, 1000));
+            }
+          }
         }
 
         // Combine all segments
-        showToast('Combining segments...', 'success');
+        showToast('Combining segments into video...', 'success');
         const combinedBlob = new Blob(downloadedData, { type: 'video/mp4' });
         
-        // Create download link
+        // Create download
         const downloadUrl = URL.createObjectURL(combinedBlob);
         const a = document.createElement('a');
         a.href = downloadUrl;
@@ -813,24 +824,25 @@ app.get('/downloader', (req, res) => {
         URL.revokeObjectURL(downloadUrl);
 
         const elapsed = (Date.now() - startTime) / 1000;
-        showToast(\`Download complete! \${formatBytes(totalSize)} in \${elapsed.toFixed(1)}s\`, 'success');
+        showToast(\`Download complete! \${formatBytes(totalSize)} in \${formatTime(elapsed)}\`, 'success');
         
         downloadBtn.innerHTML = '<i class="fas fa-check"></i> Download Complete';
         
       } catch (error) {
         console.error('Download error:', error);
         showToast('Error: ' + error.message, 'error');
-        downloadBtn.innerHTML = '<i class="fas fa-download"></i> Try Again';
+        downloadBtn.innerHTML = '<i class="fas fa-redo"></i> Try Again';
       } finally {
         isDownloading = false;
         downloadBtn.disabled = false;
-        downloadBtn.classList.remove('loading');
       }
     }
 
     // Initialize
     if ('${url}') {
       document.getElementById('videoUrl').textContent = '${url}';
+      // Parse master playlist on load
+      parseMasterPlaylist('${url}');
     }
   </script>
 </body>
@@ -839,7 +851,7 @@ app.get('/downloader', (req, res) => {
   res.send(html);
 });
 
-// SNOW PLAYER - Professional Video Player
+// Update player with download button
 app.get('/player', (req, res) => {
   const { url } = req.query;
   
@@ -966,7 +978,6 @@ app.get('/player', (req, res) => {
             </div>
           </div>
 
-          <!-- Download Button -->
           <button class="control-btn" id="download-btn" title="Download Video" onclick="window.open('/downloader?url=${encodeURIComponent(url)}', '_blank')">
             <i class="fas fa-download"></i>
           </button>
@@ -1027,7 +1038,7 @@ app.get('/player', (req, res) => {
             lowLatencyMode: true
           });
           
-          hls.loadSource('/proxy?url=' + encodeURIComponent(url));
+          hls.loadSource('/proxy?url=' + encodeURIComponent(url) + '&full=true');
           hls.attachMedia(video);
           
           hls.on(Hls.Events.MANIFEST_PARSED, () => {
@@ -1073,7 +1084,7 @@ app.get('/player', (req, res) => {
             updateBufferBar();
           });
         } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-          video.src = '/proxy?url=' + encodeURIComponent(url);
+          video.src = '/proxy?url=' + encodeURIComponent(url) + '&full=true';
           video.addEventListener('loadedmetadata', () => {
             loading.style.display = 'none';
             video.play().catch(() => {
@@ -1418,65 +1429,6 @@ app.get('/player', (req, res) => {
 </html>`;
 
   res.send(html);
-});
-
-// Health check endpoint
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', message: 'Snow Player is running' });
-});
-
-// Root endpoint
-app.get('/', (req, res) => {
-  res.send(`
-    <html>
-      <head>
-        <title>Snow Player</title>
-        <style>
-          body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            height: 100vh;
-            margin: 0;
-            text-align: center;
-          }
-          .container {
-            background: rgba(255,255,255,0.1);
-            backdrop-filter: blur(10px);
-            padding: 40px;
-            border-radius: 20px;
-            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
-          }
-          h1 {
-            font-size: 48px;
-            margin-bottom: 20px;
-          }
-          p {
-            font-size: 18px;
-            margin-bottom: 30px;
-            opacity: 0.9;
-          }
-          .url {
-            background: rgba(255,255,255,0.2);
-            padding: 15px;
-            border-radius: 10px;
-            font-family: monospace;
-            word-break: break-all;
-          }
-        </style>
-      </head>
-      <body>
-        <div class="container">
-          <h1>❄️ Snow Player</h1>
-          <p>Professional Video Player & Downloader</p>
-          <div class="url">Use: /player?url=YOUR_HLS_URL</div>
-        </div>
-      </body>
-    </html>
-  `);
 });
 
 // Export for Vercel
