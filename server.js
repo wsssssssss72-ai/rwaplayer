@@ -1,238 +1,299 @@
-
 const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
-const { spawn, exec } = require('child_process');
-const fs = require('fs');
-const path = require('path');
-const crypto = require('crypto');
-const os = require('os');
-const util = require('util');
-const execPromise = util.promisify(exec);
-const stream = require('stream');
-const { promisify } = require('util');
-const pipeline = promisify(stream.pipeline);
-
 const app = express();
-app.use(cors());
-app.use(express.json({ limit: '500mb' }));
-app.use(express.urlencoded({ extended: true, limit: '500mb' }));
 
+app.use(cors());
 const PORT = process.env.PORT || 3000;
 
-// Create temp directory with unique ID
-const TEMP_DIR = path.join(os.tmpdir(), 'snow_player_' + Date.now() + '_' + crypto.randomBytes(4).toString('hex'));
-if (!fs.existsSync(TEMP_DIR)) {
-  fs.mkdirSync(TEMP_DIR, { recursive: true });
-}
-
-// Clean up temp files on exit
-process.on('exit', () => {
-  try {
-    fs.rmSync(TEMP_DIR, { recursive: true, force: true });
-  } catch (e) {}
-});
-
-// Utility functions
-function generateId() {
-  return crypto.randomBytes(8).toString('hex');
-}
-
-function formatBytes(bytes) {
-  if (bytes === 0) return '0 Bytes';
-  const k = 1024;
-  const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
-}
-
-// Enhanced proxy with full HLS support
+// Proxy for .m3u8 playlists
 app.get('/proxy', async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  const { url, depth = '0' } = req.query;
-  
+  const { url } = req.query;
   if (!url) return res.status(400).send('Missing url parameter');
 
   try {
-    const response = await axios.get(decodeURIComponent(url), {
+    const response = await axios.get(url, {
       headers: {
         "accept": "*/*",
-        "Referer": "https://appx-play.akamai.net.in/",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Origin": "https://appx-play.akamai.net.in",
-        "Connection": "keep-alive"
-      },
-      timeout: 60000,
-      maxRedirects: 5,
-      responseType: 'text'
+        "Referer": "https://appx-play.akamai.net.in/"
+      }
     });
 
-    const contentType = response.headers['content-type'] || '';
-    
-    // Check if this is a playlist
-    if (contentType.includes('m3u8') || response.data.includes('#EXTM3U')) {
-      const baseUrl = url.substring(0, url.lastIndexOf('/') + 1);
-      let playlist = response.data;
-      
-      // Parse and rewrite all segment URLs
-      const lines = playlist.split('\n');
-      const newLines = [];
-      
-      for (let line of lines) {
-        if (line.startsWith('#EXT-X-STREAM-INF')) {
-          newLines.push(line);
-        } else if (line.startsWith('#') || line.trim() === '') {
-          newLines.push(line);
-        } else {
-          // This is a segment or variant URL
-          const segmentUrl = line.trim();
-          const absoluteUrl = segmentUrl.startsWith('http') ? segmentUrl : new URL(segmentUrl, baseUrl).href;
-          newLines.push(`/proxy?url=${encodeURIComponent(absoluteUrl)}&depth=${parseInt(depth) + 1}`);
-        }
+    const base = url.substring(0, url.lastIndexOf('/') + 1);
+    const playlist = response.data.replace(
+      /^(?!#)([^\r\n]+)$/gm,
+      (line) => {
+        if (line.startsWith('http') || line.startsWith('#')) return line;
+        return `/segment?base=${encodeURIComponent(base)}&file=${encodeURIComponent(line)}`;
       }
-      
-      res.setHeader('content-type', 'application/vnd.apple.mpegurl');
-      return res.send(newLines.join('\n'));
-    } else {
-      // Direct file, stream it
-      const fileResponse = await axios.get(decodeURIComponent(url), {
-        headers: {
-          "accept": "*/*",
-          "Referer": "https://appx-play.akamai.net.in/",
-          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-        },
-        responseType: 'stream',
-        timeout: 60000
-      });
-      
-      res.setHeader('content-type', fileResponse.headers['content-type'] || 'application/octet-stream');
-      if (fileResponse.headers['content-length']) {
-        res.setHeader('content-length', fileResponse.headers['content-length']);
-      }
-      fileResponse.data.pipe(res);
-    }
+    );
+
+    res.setHeader('content-type', 'application/vnd.apple.mpegurl');
+    res.send(playlist);
   } catch (err) {
-    console.error('Proxy error:', err.message);
+    console.error('Error fetching playlist:', err.message);
     res.status(500).send('Proxy error: ' + err.message);
   }
 });
 
-// Segment proxy for direct segment access
+// Proxy for .ts segments
 app.get('/segment', async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  const { url } = req.query;
-  
-  if (!url) return res.status(400).send('Missing url parameter');
+  const { base, file } = req.query;
+  if (!base || !file) return res.status(400).send('Missing base or file parameter');
 
+  const segmentUrl = base + file;
   try {
-    const response = await axios.get(decodeURIComponent(url), {
+    const response = await axios.get(segmentUrl, {
       headers: {
         "accept": "*/*",
-        "Referer": "https://appx-play.akamai.net.in/",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        "Referer": "https://appx-play.akamai.net.in/"
       },
-      responseType: 'stream',
-      timeout: 60000
+      responseType: 'stream'
     });
 
-    res.setHeader('content-type', response.headers['content-type'] || 'video/MP2T');
-    if (response.headers['content-length']) {
-      res.setHeader('content-length', response.headers['content-length']);
+    res.status(response.status);
+    for (const [key, value] of Object.entries(response.headers)) {
+      res.setHeader(key, value);
     }
     response.data.pipe(res);
   } catch (err) {
-    console.error('Segment error:', err);
-    res.status(500).send('Segment error: ' + err.message);
+    console.error('Error fetching segment:', err.message);
+    res.status(500).send('Proxy error: ' + err.message);
   }
 });
 
-// Master download endpoint with multiple strategies
-app.get('/api/download', async (req, res) => {
+// PDF routes
+app.get('/pdf', async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  const { url, method = 'auto', quality = 'best' } = req.query;
-  
-  if (!url) {
-    return res.status(400).json({ error: 'Missing url parameter' });
-  }
-
-  const downloadId = generateId();
-  const downloadPath = path.join(TEMP_DIR, downloadId);
-  fs.mkdirSync(downloadPath);
-  
-  const outputFile = path.join(downloadPath, 'video.mp4');
-  const logFile = path.join(downloadPath, 'log.txt');
-
-  res.json({
-    success: true,
-    downloadId,
-    message: 'Download started',
-    statusUrl: `/api/status/${downloadId}`,
-    downloadUrl: `/api/file/${downloadId}`
-  });
-});
-
-// Download status endpoint
-app.get('/api/status/:id', (req, res) => {
-  const { id } = req.params;
-  const downloadPath = path.join(TEMP_DIR, id);
-  
-  if (!fs.existsSync(downloadPath)) {
-    return res.status(404).json({ error: 'Download not found' });
-  }
-
-  const statusFile = path.join(downloadPath, 'status.json');
-  const logFile = path.join(downloadPath, 'log.txt');
-  
-  let status = { id, status: 'unknown' };
-  if (fs.existsSync(statusFile)) {
-    status = JSON.parse(fs.readFileSync(statusFile, 'utf8'));
-  }
-  
-  if (fs.existsSync(logFile)) {
-    status.log = fs.readFileSync(logFile, 'utf8').split('\n').filter(l => l);
-  }
-  
-  res.json(status);
-});
-
-// Download file endpoint
-app.get('/api/file/:id', (req, res) => {
-  const { id } = req.params;
-  const downloadPath = path.join(TEMP_DIR, id);
-  const videoFile = path.join(downloadPath, 'video.mp4');
-  
-  if (!fs.existsSync(videoFile)) {
-    return res.status(404).send('File not found');
-  }
-
-  const stat = fs.statSync(videoFile);
-  res.setHeader('Content-Length', stat.size);
-  res.setHeader('Content-Type', 'video/mp4');
-  res.setHeader('Content-Disposition', `attachment; filename="snow_player_${id}.mp4"`);
-  
-  const fileStream = fs.createReadStream(videoFile);
-  fileStream.pipe(res);
-  
-  // Clean up after download
-  fileStream.on('end', () => {
-    setTimeout(() => {
-      try {
-        fs.rmSync(downloadPath, { recursive: true, force: true });
-      } catch (e) {}
-    }, 60000);
-  });
-});
-
-// Advanced web downloader with complete HLS processing
-app.get('/downloader', (req, res) => {
   const { url } = req.query;
-  
-  const html = `<!DOCTYPE html>
-<html>
+  if (!url) return res.status(400).send('Missing url parameter');
+
+  try {
+    const forwardHeaders = {
+      accept: req.headers.accept || 'application/pdf,application/octet-stream,*/*',
+      referer: 'https://appx-play.akamai.net.in/',
+      'user-agent': req.headers['user-agent'] || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+    };
+
+    if (req.headers.range) {
+      forwardHeaders.Range = req.headers.range;
+    }
+
+    const upstream = await axios.get(url, {
+      headers: forwardHeaders,
+      responseType: 'stream',
+      validateStatus: status => status < 400
+    });
+
+    res.status(upstream.status);
+    const incomingHeaders = upstream.headers || {};
+    res.setHeader('content-type', incomingHeaders['content-type'] || 'application/pdf');
+    if (incomingHeaders['content-length']) res.setHeader('content-length', incomingHeaders['content-length']);
+    if (incomingHeaders['accept-ranges']) res.setHeader('accept-ranges', incomingHeaders['accept-ranges']);
+    if (incomingHeaders['content-range']) res.setHeader('content-range', incomingHeaders['content-range']);
+    res.setHeader('content-disposition', 'inline; filename="document.pdf"');
+    upstream.data.pipe(res);
+  } catch (err) {
+    console.error('Error fetching PDF:', err.message || err);
+    res.status(500).send('Proxy error: ' + (err.message || 'unknown error'));
+  }
+});
+
+app.get('/pdf-viewer', async (req, res) => {
+  const { url, dl = '0' } = req.query;
+  if (!url) return res.status(400).send('Missing url parameter');
+
+  try {
+    if (dl === '1') {
+      const upstream = await axios.get(url, {
+        headers: {
+          referer: 'https://appx-play.akamai.net.in/',
+          'user-agent': req.headers['user-agent'] || 'Mozilla/5.0'
+        },
+        responseType: 'stream'
+      });
+
+      res.setHeader('content-type', upstream.headers['content-type'] || 'application/pdf');
+      res.setHeader('content-disposition', `attachment; filename="document_${Date.now()}.pdf"`);
+      upstream.data.pipe(res);
+      return;
+    }
+
+    const encodedUrl = encodeURIComponent(url);
+    
+    const viewerHTML = `<!DOCTYPE html>
+<html lang="en">
 <head>
-  <title>Snow Player Professional - Complete HLS Downloader</title>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Snow PDF Viewer</title>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0a0a0a; height: 100vh; display: flex; flex-direction: column; }
+    .toolbar { background: rgba(20,20,20,0.95); backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); border-bottom: 1px solid rgba(255,255,255,0.1); padding: 12px 20px; display: flex; align-items: center; gap: 15px; color: white; }
+    .toolbar button { background: transparent; border: none; color: rgba(255,255,255,0.7); width: 36px; height: 36px; border-radius: 8px; cursor: pointer; transition: all 0.2s; display: flex; align-items: center; justify-content: center; font-size: 16px; }
+    .toolbar button:hover { background: rgba(255,255,255,0.1); color: white; }
+    .toolbar .spacer { flex-grow: 1; }
+    .toolbar .page-info { font-size: 13px; color: rgba(255,255,255,0.5); padding: 0 10px; }
+    .toolbar .download-btn { background: #2a2a2a; width: auto; padding: 0 16px; border-radius: 8px; color: white; }
+    .toolbar .download-btn:hover { background: #3a3a3a; }
+    .viewer-container { flex: 1; overflow: auto; position: relative; background: #1a1a1a; display: flex; justify-content: center; align-items: flex-start; padding: 20px; }
+    #pdf-viewer { box-shadow: 0 5px 20px rgba(0,0,0,0.5); border-radius: 4px; max-width: 100%; }
+    .loading { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); color: white; font-size: 14px; background: rgba(0,0,0,0.7); padding: 12px 24px; border-radius: 30px; border: 1px solid rgba(255,255,255,0.1); }
+    .zoom-controls { display: flex; align-items: center; gap: 5px; background: rgba(255,255,255,0.05); padding: 3px; border-radius: 8px; }
+    .zoom-controls button { width: 32px; height: 32px; }
+    #zoom-reset { width: auto; padding: 0 12px; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <div class="toolbar">
+    <button id="prev-page"><i class="fas fa-chevron-left"></i></button>
+    <button id="next-page"><i class="fas fa-chevron-right"></i></button>
+    <span class="page-info">Page <span id="page-num">1</span> of <span id="page-count">0</span></span>
+    
+    <div class="zoom-controls">
+      <button id="zoom-out"><i class="fas fa-search-minus"></i></button>
+      <button id="zoom-reset">100%</button>
+      <button id="zoom-in"><i class="fas fa-search-plus"></i></button>
+    </div>
+    
+    <div class="spacer"></div>
+    
+    <button class="download-btn" id="download"><i class="fas fa-download"></i> Download</button>
+  </div>
+  
+  <div class="viewer-container">
+    <div class="loading">Loading PDF...</div>
+    <canvas id="pdf-viewer"></canvas>
+  </div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.4.120/pdf.min.js"></script>
+  <script>
+    pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.4.120/pdf.worker.min.js';
+    
+    let pdfDoc = null, pageNum = 1, pageRendering = false, pageNumPending = null, scale = 1.0;
+    const canvas = document.getElementById('pdf-viewer');
+    const ctx = canvas.getContext('2d');
+    
+    function initPDFViewer() {
+      const pdfUrl = decodeURIComponent("${encodedUrl}");
+      
+      const loadingTask = pdfjsLib.getDocument({
+        url: '/pdf?url=' + encodeURIComponent(pdfUrl),
+        withCredentials: false,
+        httpHeaders: { 'Referer': 'https://appx-play.akamai.net.in/', 'User-Agent': navigator.userAgent }
+      });
+      
+      loadingTask.promise.then(function(pdf) {
+        pdfDoc = pdf;
+        document.getElementById('page-count').textContent = pdf.numPages;
+        renderPage(pageNum);
+      }).catch(function(err) {
+        document.querySelector('.loading').innerHTML = 'Error loading PDF';
+      });
+    }
+    
+    function renderPage(num) {
+      pageRendering = true;
+      document.querySelector('.loading').style.display = 'block';
+      
+      const dpr = window.devicePixelRatio || 1;
+      const container = canvas.parentElement;
+      
+      pdfDoc.getPage(num).then(function(page) {
+        const viewport = page.getViewport({ scale: 1.0 });
+        const containerWidth = container.clientWidth - 40;
+        const containerHeight = container.clientHeight - 40;
+        
+        scale = Math.min(containerWidth / viewport.width, containerHeight / viewport.height, 2.0);
+        if (scale < 0.5) scale = 0.5;
+        
+        const scaledViewport = page.getViewport({ scale: scale * dpr });
+        
+        canvas.width = scaledViewport.width;
+        canvas.height = scaledViewport.height;
+        canvas.style.width = (scaledViewport.width / dpr) + 'px';
+        canvas.style.height = (scaledViewport.height / dpr) + 'px';
+        
+        const renderContext = {
+          canvasContext: ctx,
+          viewport: scaledViewport
+        };
+        
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        
+        const renderTask = page.render(renderContext);
+        renderTask.promise.then(function() {
+          pageRendering = false;
+          document.querySelector('.loading').style.display = 'none';
+          if (pageNumPending !== null) {
+            renderPage(pageNumPending);
+            pageNumPending = null;
+          }
+        });
+      });
+      
+      document.getElementById('page-num').textContent = num;
+      document.getElementById('zoom-reset').textContent = Math.round(scale * 100) + '%';
+    }
+
+    function queueRenderPage(num) {
+      if (pageRendering) pageNumPending = num;
+      else renderPage(num);
+    }
+    
+    function prevPage() { if (pageNum <= 1) return; pageNum--; queueRenderPage(pageNum); }
+    function nextPage() { if (pageNum >= pdfDoc.numPages) return; pageNum++; queueRenderPage(pageNum); }
+    function zoomIn() { scale = Math.min(scale * 1.2, 3.0); queueRenderPage(pageNum); }
+    function zoomOut() { scale = Math.max(scale / 1.2, 0.5); queueRenderPage(pageNum); }
+    function zoomReset() { scale = 1.0; queueRenderPage(pageNum); }
+    
+    document.getElementById('prev-page').addEventListener('click', prevPage);
+    document.getElementById('next-page').addEventListener('click', nextPage);
+    document.getElementById('zoom-in').addEventListener('click', zoomIn);
+    document.getElementById('zoom-out').addEventListener('click', zoomOut);
+    document.getElementById('zoom-reset').addEventListener('click', zoomReset);
+    document.getElementById('download').addEventListener('click', () => {
+      window.location.href = window.location.pathname + '?url=${encodedUrl}&dl=1';
+    });
+    
+    window.addEventListener('load', initPDFViewer);
+    window.addEventListener('resize', () => { if (pdfDoc) queueRenderPage(pageNum); });
+  </script>
+</body>
+</html>`;
+
+    res.setHeader('content-type', 'text/html');
+    res.send(viewerHTML);
+  } catch (err) {
+    res.status(500).send('Error loading PDF viewer');
+  }
+});
+
+// SNOW PLAYER - Professional Minimalist UI
+app.get('/player', (req, res) => {
+  const { url } = req.query;
+  
+  if (!url) {
+    return res.status(400).send(`
+      <html>
+        <body style="background:#0a0a0a;color:white;display:flex;justify-content:center;align-items:center;height:100vh;font-family:Arial;">
+          <h1 style="font-weight:300;">Missing URL parameter - /player?url=STREAM_URL</h1>
+        </body>
+      </html>
+    `);
+  }
+
+  const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>SNOW PLAYER - Professional Video Player</title>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
   <style>
     * {
       margin: 0;
@@ -240,959 +301,846 @@ app.get('/downloader', (req, res) => {
       box-sizing: border-box;
     }
 
-    :root {
-      --primary: #667eea;
-      --secondary: #764ba2;
-      --success: #10b981;
-      --danger: #ef4444;
-      --warning: #f59e0b;
-      --dark: #1a1a1a;
-      --light: #f7f7f7;
-    }
-
     body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-      min-height: 100vh;
-      padding: 20px;
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: #000;
+      overflow: hidden;
     }
 
-    .container {
-      max-width: 1400px;
-      margin: 0 auto;
-    }
-
-    /* Header */
-    .header {
-      background: rgba(255, 255, 255, 0.95);
-      backdrop-filter: blur(10px);
-      border-radius: 20px;
-      padding: 30px;
-      margin-bottom: 20px;
-      box-shadow: 0 20px 40px rgba(0,0,0,0.2);
-    }
-
-    h1 {
-      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-      -webkit-background-clip: text;
-      -webkit-text-fill-color: transparent;
-      font-size: 42px;
-      margin-bottom: 10px;
-    }
-
-    .url-box {
-      background: #f5f5f5;
-      border-radius: 12px;
-      padding: 20px;
-      margin: 20px 0;
-      word-break: break-all;
-      border: 1px solid #e0e0e0;
-    }
-
-    /* Quality Grid */
-    .quality-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-      gap: 15px;
-      margin: 20px 0;
-    }
-
-    .quality-card {
-      background: white;
-      border: 2px solid #e0e0e0;
-      border-radius: 12px;
-      padding: 20px;
-      cursor: pointer;
-      transition: all 0.3s;
-      text-align: center;
-    }
-
-    .quality-card:hover {
-      border-color: var(--primary);
-      transform: translateY(-5px);
-      box-shadow: 0 10px 30px rgba(102, 126, 234, 0.2);
-    }
-
-    .quality-card.active {
-      border-color: var(--primary);
-      background: linear-gradient(135deg, #667eea10, #764ba210);
-    }
-
-    .quality-card .resolution {
-      font-size: 24px;
-      font-weight: 700;
-      color: var(--primary);
-      margin-bottom: 5px;
-    }
-
-    .quality-card .bandwidth {
-      font-size: 14px;
-      color: #666;
-    }
-
-    /* Stats Grid */
-    .stats-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-      gap: 20px;
-      margin: 30px 0;
-    }
-
-    .stat-card {
-      background: white;
-      border-radius: 15px;
-      padding: 25px;
-      text-align: center;
-      box-shadow: 0 10px 30px rgba(0,0,0,0.1);
-    }
-
-    .stat-card .value {
-      font-size: 36px;
-      font-weight: 700;
-      color: var(--primary);
-      margin-bottom: 10px;
-    }
-
-    .stat-card .label {
-      color: #666;
-      font-size: 14px;
-      text-transform: uppercase;
-      letter-spacing: 1px;
-    }
-
-    /* Progress Area */
-    .progress-area {
-      background: white;
-      border-radius: 15px;
-      padding: 30px;
-      margin: 20px 0;
-    }
-
-    .progress-header {
-      display: flex;
-      justify-content: space-between;
-      margin-bottom: 15px;
-    }
-
-    .progress-bar {
+    #player-container {
+      position: fixed;
+      top: 0;
+      left: 0;
       width: 100%;
-      height: 30px;
-      background: #f0f0f0;
-      border-radius: 15px;
-      overflow: hidden;
-      margin: 15px 0;
-    }
-
-    .progress-fill {
       height: 100%;
-      background: linear-gradient(90deg, var(--primary), var(--secondary));
-      width: 0%;
-      transition: width 0.3s ease;
-      position: relative;
-      overflow: hidden;
+      background: #000;
     }
 
-    .progress-fill::after {
-      content: '';
+    #video {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+    }
+
+    /* Loading Animation - Minimal */
+    #loading {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      text-align: center;
+      color: rgba(255,255,255,0.9);
+      z-index: 10;
+    }
+
+    .loader {
+      width: 40px;
+      height: 40px;
+      margin: 0 auto 16px;
+      border: 2px solid rgba(255,255,255,0.1);
+      border-top: 2px solid #fff;
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+
+    @keyframes spin {
+      0% { transform: rotate(0deg); }
+      100% { transform: rotate(360deg); }
+    }
+
+    #loading span {
+      font-size: 13px;
+      font-weight: 400;
+      letter-spacing: 1px;
+      text-transform: uppercase;
+      opacity: 0.7;
+    }
+
+    /* Controls - Ultra Clean */
+    .controls {
+      position: absolute;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      padding: 40px 24px 20px;
+      background: linear-gradient(to top, rgba(0,0,0,0.8), transparent);
+      transition: opacity 0.3s ease;
+      opacity: 1;
+      z-index: 5;
+    }
+
+    .controls.hidden {
+      opacity: 0;
+      pointer-events: none;
+    }
+
+    /* Progress Bar - Minimal */
+    .progress-container {
+      width: 100%;
+      height: 3px;
+      background: rgba(255,255,255,0.15);
+      cursor: pointer;
+      position: relative;
+      margin-bottom: 18px;
+      border-radius: 0;
+    }
+
+    #progress-bar {
+      height: 100%;
+      background: #fff;
+      width: 0%;
+      position: relative;
+      z-index: 2;
+      transition: width 0.1s linear;
+    }
+
+    #buffer-bar {
       position: absolute;
       top: 0;
       left: 0;
-      right: 0;
-      bottom: 0;
-      background: linear-gradient(
-        90deg,
-        transparent,
-        rgba(255, 255, 255, 0.3),
-        transparent
-      );
-      animation: shimmer 2s infinite;
+      height: 100%;
+      background: rgba(255,255,255,0.3);
+      width: 0%;
+      z-index: 1;
     }
 
-    @keyframes shimmer {
-      0% { transform: translateX(-100%); }
-      100% { transform: translateX(100%); }
+    #progress-handle {
+      position: absolute;
+      top: 50%;
+      transform: translate(-50%, -50%);
+      width: 10px;
+      height: 10px;
+      background: #fff;
+      border-radius: 50%;
+      z-index: 10;
+      pointer-events: none;
+      opacity: 0;
+      transition: opacity 0.2s, transform 0.2s;
+      box-shadow: 0 2px 6px rgba(0,0,0,0.3);
     }
 
-    /* Segment Grid */
-    .segment-grid {
-      background: var(--dark);
-      border-radius: 15px;
-      padding: 20px;
-      margin: 20px 0;
-      max-height: 500px;
-      overflow-y: auto;
+    .progress-container:hover #progress-handle {
+      opacity: 1;
+      transform: translate(-50%, -50%) scale(1.2);
     }
 
-    .segment-row {
-      display: grid;
-      grid-template-columns: 60px 1fr 120px 100px 80px;
-      gap: 10px;
-      padding: 10px;
-      margin: 5px 0;
-      background: rgba(255,255,255,0.05);
-      border-radius: 8px;
-      color: #00ff00;
-      font-family: monospace;
-      font-size: 12px;
+    /* Main Controls Row */
+    .main-controls {
+      display: flex;
       align-items: center;
+      justify-content: space-between;
     }
 
-    .segment-row.header {
-      background: rgba(255,255,255,0.1);
-      color: white;
-      font-weight: 600;
-      position: sticky;
-      top: 0;
+    .left-controls, .right-controls {
+      display: flex;
+      align-items: center;
+      gap: 20px;
     }
 
-    .segment-row .status {
-      padding: 4px 8px;
-      border-radius: 4px;
-      text-align: center;
-      font-weight: 600;
-    }
-
-    .status.pending {
-      background: #f59e0b;
-      color: white;
-    }
-
-    .status.downloading {
-      background: #3498db;
-      color: white;
-      animation: pulse 1s infinite;
-    }
-
-    .status.completed {
-      background: #10b981;
-      color: white;
-    }
-
-    .status.failed {
-      background: #ef4444;
-      color: white;
-    }
-
-    @keyframes pulse {
-      0%, 100% { opacity: 1; }
-      50% { opacity: 0.7; }
-    }
-
-    /* Download Button */
-    .download-btn {
-      background: linear-gradient(135deg, var(--primary), var(--secondary));
-      color: white;
+    /* Control Buttons - Minimal */
+    .control-btn {
+      background: transparent;
       border: none;
-      padding: 20px 40px;
-      border-radius: 50px;
-      font-size: 20px;
-      font-weight: 600;
+      color: rgba(255,255,255,0.8);
+      width: 36px;
+      height: 36px;
+      border-radius: 50%;
       cursor: pointer;
-      width: 100%;
-      transition: all 0.3s;
-      margin: 20px 0;
-      position: relative;
-      overflow: hidden;
-    }
-
-    .download-btn:hover {
-      transform: translateY(-2px);
-      box-shadow: 0 10px 30px rgba(102, 126, 234, 0.4);
-    }
-
-    .download-btn:disabled {
-      opacity: 0.6;
-      cursor: not-allowed;
-    }
-
-    /* Console */
-    .console {
-      background: #1a1a1a;
-      border-radius: 15px;
-      padding: 20px;
-      margin: 20px 0;
-      font-family: 'Courier New', monospace;
-      color: #00ff00;
-      max-height: 300px;
-      overflow-y: auto;
-    }
-
-    .console-line {
-      padding: 5px 0;
-      border-bottom: 1px solid #333;
-      font-size: 12px;
-    }
-
-    .console-line .time {
-      color: #888;
-      margin-right: 15px;
-    }
-
-    /* Toast */
-    .toast {
-      position: fixed;
-      top: 20px;
-      right: 20px;
-      background: white;
-      border-radius: 12px;
-      padding: 16px 24px;
-      box-shadow: 0 10px 40px rgba(0,0,0,0.2);
       display: flex;
       align-items: center;
-      gap: 15px;
-      transform: translateX(400px);
-      transition: transform 0.3s ease;
-      z-index: 1000;
+      justify-content: center;
+      font-size: 18px;
+      transition: all 0.2s;
     }
 
-    .toast.show {
-      transform: translateX(0);
+    .control-btn:hover {
+      color: #fff;
+      background: rgba(255,255,255,0.1);
     }
 
-    .toast.success {
-      border-left: 4px solid var(--success);
+    .control-btn:active {
+      transform: scale(0.95);
     }
 
-    .toast.error {
-      border-left: 4px solid var(--danger);
+    /* Play Button - Accent */
+    #play-btn {
+      background: rgba(255,255,255,0.1);
+      color: #fff;
+      width: 40px;
+      height: 40px;
+      font-size: 20px;
     }
 
-    /* Tabs */
-    .tabs {
+    #play-btn:hover {
+      background: rgba(255,255,255,0.2);
+    }
+
+    /* Skip Buttons */
+    .skip-btn {
+      font-size: 16px;
+      position: relative;
+    }
+
+    /* Time Display */
+    .time-display {
+      font-size: 13px;
+      font-weight: 400;
+      color: rgba(255,255,255,0.7);
+      letter-spacing: 0.3px;
+      background: rgba(0,0,0,0.3);
+      padding: 4px 10px;
+      border-radius: 12px;
+    }
+
+    /* Volume Control - Minimal */
+    .volume-container {
       display: flex;
-      gap: 10px;
-      margin: 20px 0;
+      align-items: center;
+      gap: 8px;
     }
 
-    .tab {
-      padding: 12px 24px;
-      background: white;
-      border-radius: 30px;
+    #volume-slider {
+      width: 70px;
+      height: 3px;
+      -webkit-appearance: none;
+      background: rgba(255,255,255,0.2);
+      border-radius: 0;
+      outline: none;
+    }
+
+    #volume-slider::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      width: 10px;
+      height: 10px;
+      background: #fff;
+      border-radius: 50%;
       cursor: pointer;
-      font-weight: 600;
-      transition: all 0.3s;
+      transition: transform 0.2s;
     }
 
-    .tab.active {
-      background: linear-gradient(135deg, var(--primary), var(--secondary));
-      color: white;
+    #volume-slider::-webkit-slider-thumb:hover {
+      transform: scale(1.2);
     }
 
-    .tab-content {
-      display: none;
+    /* Settings Menu */
+    .settings-menu {
+      position: relative;
     }
 
-    .tab-content.active {
-      display: block;
+    .settings-dropdown {
+      position: absolute;
+      bottom: 45px;
+      right: 0;
+      background: rgba(20,20,20,0.95);
+      backdrop-filter: blur(10px);
+      -webkit-backdrop-filter: blur(10px);
+      border-radius: 8px;
+      padding: 4px 0;
+      width: 140px;
+      border: 1px solid rgba(255,255,255,0.1);
+      opacity: 0;
+      transform: translateY(10px);
+      pointer-events: none;
+      transition: all 0.2s;
+      box-shadow: 0 5px 20px rgba(0,0,0,0.5);
     }
 
+    .settings-menu.active .settings-dropdown {
+      opacity: 1;
+      transform: translateY(0);
+      pointer-events: all;
+    }
+
+    .settings-item {
+      padding: 10px 16px;
+      cursor: pointer;
+      color: rgba(255,255,255,0.7);
+      font-size: 13px;
+      transition: all 0.2s;
+      text-align: left;
+    }
+
+    .settings-item:hover {
+      background: rgba(255,255,255,0.1);
+      color: #fff;
+    }
+
+    .settings-item.selected {
+      color: #fff;
+      background: rgba(255,255,255,0.05);
+    }
+
+    /* Quality Badge */
+    .quality-badge {
+      position: absolute;
+      top: 20px;
+      left: 20px;
+      background: rgba(0,0,0,0.5);
+      color: rgba(255,255,255,0.8);
+      padding: 4px 12px;
+      border-radius: 20px;
+      font-size: 11px;
+      font-weight: 400;
+      letter-spacing: 0.5px;
+      border: 1px solid rgba(255,255,255,0.1);
+      z-index: 10;
+      opacity: 0;
+      transition: opacity 0.2s;
+    }
+
+    .quality-badge.visible {
+      opacity: 1;
+    }
+
+    /* Fullscreen Button */
+    #fullscreen-btn {
+      font-size: 18px;
+    }
+
+    /* Mobile Optimizations */
     @media (max-width: 768px) {
-      .segment-row {
-        grid-template-columns: 40px 1fr 80px 70px 60px;
-        font-size: 10px;
-      }
+      .controls { padding: 30px 16px 16px; }
+      .left-controls { gap: 12px; }
+      .right-controls { gap: 12px; }
+      .control-btn { width: 32px; height: 32px; font-size: 16px; }
+      #play-btn { width: 36px; height: 36px; }
+      .time-display { font-size: 12px; padding: 3px 8px; }
+      #volume-slider { width: 50px; }
     }
   </style>
 </head>
 <body>
-  <div class="container">
-    <div class="header">
-      <h1>❄️ Snow Player Professional</h1>
-      <p style="color: #666;">Enterprise-grade HLS video downloader with complete segment processing</p>
+  <div id="player-container">
+    <video id="video" playsinline></video>
+    
+    <div id="loading">
+      <div class="loader"></div>
+      <span>SNOW PLAYER</span>
+    </div>
+
+    <div class="quality-badge" id="quality-badge">
+      <i class="fas fa-hd"></i> AUTO
+    </div>
+    
+    <div class="controls">
+      <div class="progress-container">
+        <div id="buffer-bar"></div>
+        <div id="progress-bar"></div>
+        <div id="progress-handle"></div>
+      </div>
       
-      <div class="url-box">
-        <strong style="display: block; margin-bottom: 10px; color: #333;">Video URL:</strong>
-        <div style="color: var(--primary); word-break: break-all;" id="videoUrl">${url || 'No URL provided'}</div>
-      </div>
-    </div>
-
-    <div class="tabs">
-      <div class="tab active" onclick="switchTab('downloader')">📥 Downloader</div>
-      <div class="tab" onclick="switchTab('analyzer')">🔍 Analyzer</div>
-      <div class="tab" onclick="switchTab('queue')">📋 Queue</div>
-    </div>
-
-    <div id="downloaderTab" class="tab-content active">
-      <div class="quality-grid" id="qualityGrid"></div>
-
-      <div class="stats-grid" id="statsGrid">
-        <div class="stat-card">
-          <div class="value" id="totalSegments">0</div>
-          <div class="label">Total Segments</div>
+      <div class="main-controls">
+        <div class="left-controls">
+          <button class="control-btn" id="play-btn">
+            <i class="fas fa-play"></i>
+          </button>
+          
+          <button class="control-btn skip-btn" id="rewind-btn">
+            <i class="fas fa-undo-alt"></i>
+          </button>
+          
+          <button class="control-btn skip-btn" id="forward-btn">
+            <i class="fas fa-redo-alt"></i>
+          </button>
+          
+          <div class="volume-container">
+            <button class="control-btn" id="volume-btn">
+              <i class="fas fa-volume-up"></i>
+            </button>
+            <input type="range" id="volume-slider" min="0" max="1" step="0.01" value="1">
+          </div>
+          
+          <div class="time-display" id="time-display">0:00 / 0:00</div>
         </div>
-        <div class="stat-card">
-          <div class="value" id="downloadedSegments">0</div>
-          <div class="label">Downloaded</div>
+        
+        <div class="right-controls">
+          <div class="settings-menu" id="settings-menu">
+            <button class="control-btn" id="settings-btn">
+              <i class="fas fa-cog"></i>
+            </button>
+            <div class="settings-dropdown" id="settings-dropdown">
+              <div class="settings-item selected" data-speed="1">Normal</div>
+              <div class="settings-item" data-speed="1.25">1.25x</div>
+              <div class="settings-item" data-speed="1.5">1.5x</div>
+              <div class="settings-item" data-speed="1.75">1.75x</div>
+              <div class="settings-item" data-speed="2">2x</div>
+              <div style="height:1px;background:rgba(255,255,255,0.1);margin:4px 0;"></div>
+              <div class="settings-item" data-speed="0.5">0.5x</div>
+              <div class="settings-item" data-speed="0.75">0.75x</div>
+            </div>
+          </div>
+          
+          <button class="control-btn" id="fullscreen-btn">
+            <i class="fas fa-expand"></i>
+          </button>
         </div>
-        <div class="stat-card">
-          <div class="value" id="totalSize">0 MB</div>
-          <div class="label">Total Size</div>
-        </div>
-        <div class="stat-card">
-          <div class="value" id="downloadSpeed">0 MB/s</div>
-          <div class="label">Speed</div>
-        </div>
-        <div class="stat-card">
-          <div class="value" id="timeRemaining">--:--</div>
-          <div class="label">Time Left</div>
-        </div>
-        <div class="stat-card">
-          <div class="value" id="successRate">100%</div>
-          <div class="label">Success Rate</div>
-        </div>
-      </div>
-
-      <div class="progress-area">
-        <div class="progress-header">
-          <span id="progressPercent">0%</span>
-          <span id="progressDetails">0 of 0 segments</span>
-        </div>
-        <div class="progress-bar">
-          <div class="progress-fill" id="progressFill"></div>
-        </div>
-      </div>
-
-      <div class="segment-grid" id="segmentGrid">
-        <div class="segment-row header">
-          <div>#</div>
-          <div>URL</div>
-          <div>Size</div>
-          <div>Speed</div>
-          <div>Status</div>
-        </div>
-      </div>
-
-      <button class="download-btn" id="downloadBtn" onclick="startDownload()">
-        <i class="fas fa-download"></i> Start Professional Download
-      </button>
-    </div>
-
-    <div id="analyzerTab" class="tab-content">
-      <div class="progress-area">
-        <h3>Stream Analyzer</h3>
-        <div id="analyzerContent">Click analyze to start</div>
-      </div>
-    </div>
-
-    <div id="queueTab" class="tab-content">
-      <div class="progress-area">
-        <h3>Download Queue</h3>
-        <div id="queueContent">No active downloads</div>
-      </div>
-    </div>
-
-    <div class="console" id="console">
-      <div class="console-line">
-        <span class="time">${new Date().toLocaleTimeString()}</span>
-        <span>Snow Player Professional initialized</span>
       </div>
     </div>
   </div>
 
-  <div class="toast" id="toast">
-    <i class="fas" id="toastIcon"></i>
-    <span id="toastMessage"></span>
-  </div>
-
-  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
   
   <script>
-    // Global state
-    let segments = [];
-    let downloadedSegments = [];
-    let segmentSizes = [];
-    let segmentSpeeds = [];
-    let totalSize = 0;
-    let startTime = null;
-    let isDownloading = false;
-    let selectedQuality = null;
-    let qualities = [];
-    let masterPlaylist = null;
-    let downloadQueue = [];
-    let activeDownloads = 0;
-    const MAX_CONCURRENT = 5;
-
-    // Console logging
-    function addLog(message, type = 'info') {
-      const console = document.getElementById('console');
-      const time = new Date().toLocaleTimeString();
-      const line = document.createElement('div');
-      line.className = 'console-line';
-      line.innerHTML = \`<span class="time">\${time}</span> \${message}\`;
-      console.appendChild(line);
-      console.scrollTop = console.scrollHeight;
-    }
-
-    // Toast notification
-    function showToast(message, type = 'success') {
-      const toast = document.getElementById('toast');
-      const icon = document.getElementById('toastIcon');
-      const toastMessage = document.getElementById('toastMessage');
+    document.addEventListener('DOMContentLoaded', () => {
+      // DOM Elements
+      const video = document.getElementById('video');
+      const loading = document.getElementById('loading');
+      const playBtn = document.getElementById('play-btn');
+      const rewindBtn = document.getElementById('rewind-btn');
+      const forwardBtn = document.getElementById('forward-btn');
+      const volumeBtn = document.getElementById('volume-btn');
+      const volumeSlider = document.getElementById('volume-slider');
+      const fullscreenBtn = document.getElementById('fullscreen-btn');
+      const settingsBtn = document.getElementById('settings-btn');
+      const settingsMenu = document.getElementById('settings-menu');
+      const settingsDropdown = document.getElementById('settings-dropdown');
+      const progressContainer = document.querySelector('.progress-container');
+      const progressBar = document.getElementById('progress-bar');
+      const bufferBar = document.getElementById('buffer-bar');
+      const progressHandle = document.getElementById('progress-handle');
+      const timeDisplay = document.getElementById('time-display');
+      const playerContainer = document.getElementById('player-container');
+      const controls = document.querySelector('.controls');
+      const qualityBadge = document.getElementById('quality-badge');
       
-      toast.className = 'toast show ' + type;
-      icon.className = 'fas ' + (type === 'success' ? 'fa-check-circle' : 'fa-exclamation-circle');
-      toastMessage.textContent = message;
+      // State
+      let hls;
+      let hideControlsTimeout;
+      let isSettingsOpen = false;
+      let isFullscreen = false;
+      let isDragging = false;
+      let hideQualityBadgeTimeout;
       
-      setTimeout(() => {
-        toast.classList.remove('show');
-      }, 5000);
-    }
-
-    // Tab switching
-    function switchTab(tab) {
-      document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-      document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+      const url = new URLSearchParams(window.location.search).get('url');
       
-      event.target.classList.add('active');
-      document.getElementById(tab + 'Tab').classList.add('active');
-    }
-
-    // Parse master playlist
-    async function parseMasterPlaylist(url) {
-      addLog('Fetching master playlist...');
-      
-      try {
-        const response = await fetch('/proxy?url=' + encodeURIComponent(url));
-        const playlist = await response.text();
-        
-        masterPlaylist = playlist;
-        const lines = playlist.split('\n');
-        const qualities = [];
-        
-        for (let i = 0; i < lines.length; i++) {
-          if (lines[i].startsWith('#EXT-X-STREAM-INF')) {
-            const resolution = lines[i].match(/RESOLUTION=(\d+x\d+)/)?.[1];
-            const bandwidth = lines[i].match(/BANDWIDTH=(\d+)/)?.[1];
-            const codecs = lines[i].match(/CODECS="([^"]+)"/)?.[1];
-            const frameRate = lines[i].match(/FRAME-RATE=([\d.]+)/)?.[1];
-            
-            let nextLine = lines[i + 1]?.trim();
-            while (nextLine && nextLine.startsWith('#')) {
-              i++;
-              nextLine = lines[i + 1]?.trim();
-            }
-            
-            if (nextLine && !nextLine.startsWith('#')) {
-              const qualityUrl = nextLine.startsWith('http') ? nextLine : new URL(nextLine, url).href;
-              
-              qualities.push({
-                resolution: resolution || 'unknown',
-                width: resolution ? parseInt(resolution.split('x')[0]) : 0,
-                height: resolution ? parseInt(resolution.split('x')[1]) : 0,
-                bandwidth: parseInt(bandwidth || '0'),
-                bandwidthMbps: (parseInt(bandwidth || '0') / 1000000).toFixed(2),
-                codecs: codecs || 'unknown',
-                frameRate: frameRate || 'unknown',
-                url: qualityUrl,
-                name: resolution ? resolution.split('x')[1] + 'p' : 'auto'
-              });
-            }
-          }
+      // Initialize Player
+      function initPlayer() {
+        if (!url) {
+          showError('Missing stream URL');
+          return;
         }
         
-        // Sort by quality (best first)
-        qualities.sort((a, b) => {
-          if (a.height !== b.height) return b.height - a.height;
-          return b.bandwidth - a.bandwidth;
-        });
-        
-        return qualities;
-      } catch (error) {
-        addLog('Error parsing master playlist: ' + error.message, 'error');
-        showToast('Error parsing playlist: ' + error.message, 'error');
-        return [];
-      }
-    }
-
-    // Render quality grid
-    function renderQualities(qualities) {
-      const grid = document.getElementById('qualityGrid');
-      grid.innerHTML = '';
-      
-      if (qualities.length === 0) {
-        grid.innerHTML = '<div style="grid-column: 1/-1; text-align: center; padding: 40px;">No quality variants found - using single stream</div>';
-        return;
-      }
-      
-      qualities.forEach((q, index) => {
-        const card = document.createElement('div');
-        card.className = 'quality-card' + (index === 0 ? ' active' : '');
-        card.setAttribute('onclick', \`selectQuality(\${index})\`);
-        card.innerHTML = \`
-          <div class="resolution">\${q.height}p</div>
-          <div class="bandwidth">\${q.bandwidthMbps} Mbps</div>
-          <div style="font-size: 12px; color: #999; margin-top: 10px;">\${q.frameRate}fps</div>
-        \`;
-        grid.appendChild(card);
-      });
-      
-      if (qualities.length > 0) {
-        selectQuality(0);
-      }
-    }
-
-    // Select quality
-    function selectQuality(index) {
-      document.querySelectorAll('.quality-card').forEach(c => c.classList.remove('active'));
-      event.target.closest('.quality-card').classList.add('active');
-      selectedQuality = qualities[index];
-      addLog(\`Selected quality: \${selectedQuality.height}p (\${selectedQuality.bandwidthMbps} Mbps)\`);
-    }
-
-    // Parse segments from playlist
-    async function parseSegments(playlistUrl) {
-      addLog('Fetching segment playlist...');
-      
-      try {
-        const response = await fetch('/proxy?url=' + encodeURIComponent(playlistUrl));
-        const playlist = await response.text();
-        
-        const lines = playlist.split('\n');
-        const segments = [];
-        let currentSegment = {};
-        let duration = 0;
-        
-        for (let i = 0; i < lines.length; i++) {
-          const line = lines[i].trim();
+        if (Hls.isSupported()) {
+          hls = new Hls({
+            maxBufferLength: 30,
+            maxMaxBufferLength: 60,
+            maxBufferSize: 30 * 1000 * 1000,
+            maxBufferHole: 0.5,
+            lowLatencyMode: true
+          });
           
-          if (line.startsWith('#EXTINF')) {
-            const durationMatch = line.match(/EXTINF:([\d.]+)/);
-            currentSegment.duration = durationMatch ? parseFloat(durationMatch[1]) : 0;
-            duration += currentSegment.duration;
-          } else if (line.startsWith('#EXT-X-KEY')) {
-            currentSegment.key = line;
-          } else if (line.startsWith('#') || line === '') {
-            // Skip comments
-          } else {
-            // This is a segment URL
-            const segmentUrl = line.startsWith('http') ? line : new URL(line, playlistUrl).href;
-            segments.push({
-              url: segmentUrl,
-              duration: currentSegment.duration || 0,
-              key: currentSegment.key,
-              index: segments.length
+          hls.loadSource('/proxy?url=' + encodeURIComponent(url));
+          hls.attachMedia(video);
+          
+          hls.on(Hls.Events.MANIFEST_PARSED, () => {
+            loading.style.display = 'none';
+            video.play().catch(() => {
+              showError('Click to play', true);
             });
-            currentSegment = {};
-          }
-        }
-        
-        addLog(\`Found \${segments.length} segments, total duration: \${duration.toFixed(2)}s\`);
-        return segments;
-      } catch (error) {
-        addLog('Error parsing segments: ' + error.message, 'error');
-        throw error;
-      }
-    }
-
-    // Render segment grid
-    function renderSegments(segments) {
-      const grid = document.getElementById('segmentGrid');
-      grid.innerHTML = \`
-        <div class="segment-row header">
-          <div>#</div>
-          <div>URL</div>
-          <div>Size</div>
-          <div>Speed</div>
-          <div>Status</div>
-        </div>
-      \`;
-      
-      segments.forEach((segment, index) => {
-        const row = document.createElement('div');
-        row.className = 'segment-row';
-        row.id = \`segment-\${index}\`;
-        row.innerHTML = \`
-          <div>#\${index + 1}</div>
-          <div style="color: #888; overflow: hidden; text-overflow: ellipsis;">\${segment.url.split('/').pop()}</div>
-          <div class="size">-</div>
-          <div class="speed">-</div>
-          <div><span class="status pending">Pending</span></div>
-        \`;
-        grid.appendChild(row);
-      });
-      
-      document.getElementById('totalSegments').textContent = segments.length;
-    }
-
-    // Update segment status
-    function updateSegmentStatus(index, status, size = 0, speed = 0) {
-      const row = document.getElementById(\`segment-\${index}\`);
-      if (!row) return;
-      
-      const statusSpan = row.querySelector('.status');
-      const sizeSpan = row.querySelector('.size');
-      const speedSpan = row.querySelector('.speed');
-      
-      statusSpan.className = 'status ' + status;
-      statusSpan.textContent = status.charAt(0).toUpperCase() + status.slice(1);
-      
-      if (size > 0) {
-        sizeSpan.textContent = formatBytes(size);
-      }
-      
-      if (speed > 0) {
-        speedSpan.textContent = formatBytes(speed) + '/s';
-      }
-    }
-
-    // Format bytes
-    function formatBytes(bytes) {
-      if (bytes === 0) return '0 B';
-      const k = 1024;
-      const sizes = ['B', 'KB', 'MB', 'GB'];
-      const i = Math.floor(Math.log(bytes) / Math.log(k));
-      return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
-    }
-
-    // Format time
-    function formatTime(seconds) {
-      if (!seconds || seconds < 0) return '--:--';
-      const hrs = Math.floor(seconds / 3600);
-      const mins = Math.floor((seconds % 3600) / 60);
-      const secs = Math.floor(seconds % 60);
-      
-      if (hrs > 0) {
-        return hrs + 'h ' + mins + 'm ' + secs + 's';
-      } else if (mins > 0) {
-        return mins + 'm ' + secs + 's';
-      } else {
-        return secs + 's';
-      }
-    }
-
-    // Update statistics
-    function updateStats() {
-      const downloadedCount = downloadedSegments.length;
-      const percent = segments.length > 0 ? (downloadedCount / segments.length * 100).toFixed(1) : 0;
-      const successRate = downloadedCount > 0 ? ((downloadedCount / segments.length) * 100).toFixed(1) : 100;
-      
-      document.getElementById('downloadedSegments').textContent = downloadedCount;
-      document.getElementById('totalSize').textContent = formatBytes(totalSize);
-      document.getElementById('progressPercent').textContent = percent + '%';
-      document.getElementById('progressDetails').textContent = \`\${downloadedCount} of \${segments.length} segments\`;
-      document.getElementById('progressFill').style.width = percent + '%';
-      document.getElementById('successRate').textContent = successRate + '%';
-      
-      if (startTime && downloadedCount > 0) {
-        const elapsed = (Date.now() - startTime) / 1000;
-        const speed = totalSize / elapsed;
-        document.getElementById('downloadSpeed').textContent = formatBytes(speed) + '/s';
-        
-        if (segments.length > downloadedCount) {
-          const remainingSegments = segments.length - downloadedCount;
-          const avgSegmentSize = totalSize / downloadedCount;
-          const remainingBytes = remainingSegments * avgSegmentSize;
-          const remainingTime = remainingBytes / speed;
-          document.getElementById('timeRemaining').textContent = formatTime(remainingTime);
-        } else {
-          document.getElementById('timeRemaining').textContent = 'Complete';
-        }
-      }
-    }
-
-    // Download segment with retry
-    async function downloadSegment(segment, retries = 3) {
-      for (let attempt = 1; attempt <= retries; attempt++) {
-        try {
-          updateSegmentStatus(segment.index, 'downloading');
-          
-          const startTime = Date.now();
-          const response = await fetch('/segment?url=' + encodeURIComponent(segment.url));
-          
-          if (!response.ok) {
-            throw new Error(\`HTTP \${response.status}\`);
-          }
-          
-          const blob = await response.blob();
-          const endTime = Date.now();
-          const speed = blob.size / ((endTime - startTime) / 1000);
-          
-          segmentSizes[segment.index] = blob.size;
-          segmentSpeeds[segment.index] = speed;
-          
-          updateSegmentStatus(segment.index, 'completed', blob.size, speed);
-          
-          return blob;
-        } catch (error) {
-          addLog(\`Segment \${segment.index + 1} download failed (attempt \${attempt}/\${retries}): \${error.message}\`, 'error');
-          
-          if (attempt === retries) {
-            updateSegmentStatus(segment.index, 'failed');
-            throw error;
-          }
-          
-          await new Promise(resolve => setTimeout(resolve, 2000 * attempt));
-        }
-      }
-    }
-
-    // Download segments with concurrency control
-    async function downloadSegments(segments) {
-      const queue = [...segments];
-      const results = [];
-      let active = 0;
-      
-      return new Promise((resolve, reject) => {
-        function next() {
-          if (queue.length === 0 && active === 0) {
-            resolve(results);
-            return;
-          }
-          
-          while (active < MAX_CONCURRENT && queue.length > 0) {
-            const segment = queue.shift();
-            active++;
+            initVolume();
+            showControls();
             
-            downloadSegment(segment)
-              .then(blob => {
-                results.push(blob);
-                downloadedSegments.push(segment);
-                totalSize += blob.size;
-                updateStats();
-                active--;
-                next();
-              })
-              .catch(error => {
-                addLog(\`Failed to download segment \${segment.index + 1}\`, 'error');
-                active--;
-                next();
-              });
+            // Show quality info
+            const levels = hls.levels;
+            if (levels && levels.length > 0) {
+              const maxHeight = Math.max(...levels.map(l => l.height || 0));
+              if (maxHeight >= 1080) qualityBadge.innerHTML = '<i class="fas fa-4k"></i> 4K';
+              else if (maxHeight >= 720) qualityBadge.innerHTML = '<i class="fas fa-hd"></i> HD';
+              else qualityBadge.innerHTML = '<i class="fas fa-sd"></i> SD';
+              showQualityBadge();
+            }
+          });
+          
+          hls.on(Hls.Events.LEVEL_SWITCHED, (event, data) => {
+            const level = hls.levels[data.level];
+            if (level) {
+              const height = level.height || 0;
+              if (height >= 1080) qualityBadge.innerHTML = '<i class="fas fa-4k"></i> 4K';
+              else if (height >= 720) qualityBadge.innerHTML = '<i class="fas fa-hd"></i> HD';
+              else qualityBadge.innerHTML = '<i class="fas fa-sd"></i> SD';
+              showQualityBadge();
+            }
+          });
+          
+          hls.on(Hls.Events.ERROR, (event, data) => {
+            if (data.fatal) {
+              if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+                hls.startLoad();
+              } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+                hls.recoverMediaError();
+              }
+            }
+          });
+          
+          hls.on(Hls.Events.FRAG_BUFFERED, () => {
+            updateBufferBar();
+          });
+        } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+          video.src = '/proxy?url=' + encodeURIComponent(url);
+          video.addEventListener('loadedmetadata', () => {
+            loading.style.display = 'none';
+            video.play().catch(() => {
+              showError('Click to play', true);
+            });
+            initVolume();
+            showControls();
+          });
+        } else {
+          showError('HLS not supported');
+        }
+        
+        // Video event listeners
+        video.addEventListener('timeupdate', updateProgress);
+        video.addEventListener('progress', updateBufferBar);
+        video.addEventListener('play', () => {
+          playBtn.innerHTML = '<i class="fas fa-pause"></i>';
+        });
+        video.addEventListener('pause', () => {
+          playBtn.innerHTML = '<i class="fas fa-play"></i>';
+        });
+        video.addEventListener('volumechange', updateVolumeIcon);
+        video.addEventListener('ended', () => {
+          playBtn.innerHTML = '<i class="fas fa-redo"></i>';
+        });
+      }
+      
+      function showError(message, clickable = false) {
+        loading.innerHTML = \`
+          <div class="loader"></div>
+          <span>\${message}</span>
+        \`;
+        if (clickable) {
+          loading.style.cursor = 'pointer';
+          loading.onclick = () => {
+            video.play();
+            loading.style.display = 'none';
+          };
+        }
+      }
+      
+      function showQualityBadge() {
+        qualityBadge.classList.add('visible');
+        clearTimeout(hideQualityBadgeTimeout);
+        hideQualityBadgeTimeout = setTimeout(() => {
+          qualityBadge.classList.remove('visible');
+        }, 2000);
+      }
+      
+      function initVolume() {
+        const savedVolume = localStorage.getItem('playerVolume');
+        const savedMuted = localStorage.getItem('playerMuted');
+  
+        if (savedVolume !== null) {
+          video.volume = parseFloat(savedVolume);
+          volumeSlider.value = video.volume;
+        }
+  
+        if (savedMuted === 'true') {
+          video.muted = true;
+          volumeBtn.innerHTML = '<i class="fas fa-volume-mute"></i>';
+          volumeSlider.value = 0;
+        } else {
+          updateVolumeIcon();
+        }
+      }
+      
+      function updateVolumeIcon() {
+        if (video.muted || video.volume === 0) {
+          volumeBtn.innerHTML = '<i class="fas fa-volume-mute"></i>';
+        } else if (video.volume < 0.5) {
+          volumeBtn.innerHTML = '<i class="fas fa-volume-down"></i>';
+        } else {
+          volumeBtn.innerHTML = '<i class="fas fa-volume-up"></i>';
+        }
+      }
+      
+      function showControls() {
+        controls.classList.remove('hidden');
+        resetHideControlsTimer();
+      }
+      
+      function hideControls() {
+        if (!video.paused && !isSettingsOpen) {
+          controls.classList.add('hidden');
+        }
+      }
+      
+      function resetHideControlsTimer() {
+        clearTimeout(hideControlsTimeout);
+        hideControlsTimeout = setTimeout(hideControls, 3000);
+      }
+      
+      // Progress Functions
+      function updateProgress() {
+        if (!isDragging && !isNaN(video.duration)) {
+          const percent = (video.currentTime / video.duration) * 100;
+          progressBar.style.width = percent + '%';
+          progressHandle.style.left = percent + '%';
+          timeDisplay.textContent = 
+            formatTime(video.currentTime) + ' / ' + formatTime(video.duration);
+        }
+      }
+      
+      function updateBufferBar() {
+        if (video.buffered.length > 0) {
+          const bufferedEnd = video.buffered.end(video.buffered.length - 1);
+          const duration = video.duration;
+          if (duration > 0) {
+            const bufferPercent = (bufferedEnd / duration) * 100;
+            bufferBar.style.width = bufferPercent + '%';
           }
         }
-        
-        next();
-      });
-    }
-
-    // Main download function
-    async function startDownload() {
-      if (isDownloading) {
-        showToast('Download already in progress', 'warning');
-        return;
       }
       
-      const urlParams = new URLSearchParams(window.location.search);
-      const videoUrl = urlParams.get('url');
-      
-      if (!videoUrl) {
-        showToast('No video URL provided', 'error');
-        return;
-      }
-
-      const downloadBtn = document.getElementById('downloadBtn');
-      downloadBtn.disabled = true;
-      downloadBtn.innerHTML = '<i class="fas fa-circle-notch fa-spin"></i> Processing...';
-      
-      isDownloading = true;
-      downloadedSegments = [];
-      segmentSizes = [];
-      segmentSpeeds = [];
-      totalSize = 0;
-      startTime = Date.now();
-
-      try {
-        // Step 1: Parse master playlist
-        addLog('Step 1: Analyzing master playlist...');
-        qualities = await parseMasterPlaylist(videoUrl);
-        renderQualities(qualities);
-        
-        // Step 2: Select best quality if none selected
-        if (!selectedQuality && qualities.length > 0) {
-          selectedQuality = qualities[0];
+      function seekToPosition(clientX) {
+        const rect = progressContainer.getBoundingClientRect();
+        const pos = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+        const percent = pos * 100;
+        progressBar.style.width = percent + '%';
+        progressHandle.style.left = percent + '%';
+        if (!isNaN(video.duration)) {
+          video.currentTime = pos * video.duration;
         }
-        
-        // Step 3: Get playlist URL
-        const playlistUrl = selectedQuality ? selectedQuality.url : videoUrl;
-        addLog(\`Step 2: Using playlist: \${playlistUrl}\`);
-        
-        // Step 4: Parse segments
-        addLog('Step 3: Parsing segment list...');
-        segments = await parseSegments(playlistUrl);
-        renderSegments(segments);
-        
-        if (segments.length === 0) {
-          throw new Error('No segments found in playlist');
-        }
-        
-        // Step 5: Download all segments
-        addLog(\`Step 4: Downloading \${segments.length} segments with \${MAX_CONCURRENT} concurrent connections...\`);
-        const blobs = await downloadSegments(segments);
-        
-        // Step 6: Combine segments
-        addLog('Step 5: Combining segments into video...');
-        const combinedBlob = new Blob(blobs, { type: 'video/mp4' });
-        
-        // Step 7: Create download
-        addLog(\`Step 6: Creating download (\${formatBytes(combinedBlob.size)})...\`);
-        const downloadUrl = URL.createObjectURL(combinedBlob);
-        const a = document.createElement('a');
-        a.href = downloadUrl;
-        a.download = 'snow_player_' + Date.now() + '.mp4';
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        URL.revokeObjectURL(downloadUrl);
-        
-        const elapsed = (Date.now() - startTime) / 1000;
-        addLog(\`✅ Download complete! Total size: \${formatBytes(combinedBlob.size)}, Time: \${formatTime(elapsed)}\`);
-        showToast(\`Download complete! \${formatBytes(combinedBlob.size)}\`, 'success');
-        
-        downloadBtn.innerHTML = '<i class="fas fa-check"></i> Download Complete';
-        
-      } catch (error) {
-        addLog('❌ Download failed: ' + error.message, 'error');
-        showToast('Error: ' + error.message, 'error');
-        downloadBtn.innerHTML = '<i class="fas fa-redo"></i> Try Again';
-      } finally {
-        isDownloading = false;
-        downloadBtn.disabled = false;
       }
-    }
-
-    // Initialize
-    if ('${url}') {
-      document.getElementById('videoUrl').textContent = '${url}';
-      parseMasterPlaylist('${url}').then(qualities => {
-        renderQualities(qualities);
+      
+      // Event Listeners
+      playerContainer.addEventListener('mousemove', showControls);
+      playerContainer.addEventListener('touchstart', showControls);
+      
+      playerContainer.addEventListener('click', (e) => {
+        if (e.target === playerContainer || e.target === video) {
+          if (controls.classList.contains('hidden')) {
+            showControls();
+          } else {
+            hideControls();
+          }
+        }
       });
-    }
+      
+      // Progress Bar Controls
+      progressContainer.addEventListener('mousedown', (e) => {
+        isDragging = true;
+        seekToPosition(e.clientX);
+        showControls();
+      });
+      
+      document.addEventListener('mousemove', (e) => {
+        if (isDragging) {
+          seekToPosition(e.clientX);
+        }
+      });
+      
+      document.addEventListener('mouseup', () => {
+        isDragging = false;
+      });
+      
+      progressContainer.addEventListener('touchstart', (e) => {
+        isDragging = true;
+        seekToPosition(e.touches[0].clientX);
+        showControls();
+      });
+      
+      document.addEventListener('touchmove', (e) => {
+        if (isDragging) {
+          seekToPosition(e.touches[0].clientX);
+        }
+      });
+      
+      document.addEventListener('touchend', () => {
+        isDragging = false;
+      });
+      
+      // Play Button
+      playBtn.addEventListener('click', () => {
+        if (video.paused) {
+          video.play();
+        } else {
+          video.pause();
+        }
+        showControls();
+      });
+      
+      // Skip Buttons
+      rewindBtn.addEventListener('click', () => {
+        video.currentTime = Math.max(0, video.currentTime - 10);
+        showControls();
+      });
+      
+      forwardBtn.addEventListener('click', () => {
+        video.currentTime = Math.min(video.duration, video.currentTime + 10);
+        showControls();
+      });
+      
+      // Volume Controls
+      volumeBtn.addEventListener('click', () => {
+        if (video.muted) {
+          video.muted = false;
+          volumeSlider.value = video.volume;
+        } else {
+          video.muted = true;
+          volumeSlider.value = 0;
+        }
+        localStorage.setItem('playerMuted', video.muted);
+        updateVolumeIcon();
+        showControls();
+      });
+      
+      volumeSlider.addEventListener('input', (e) => {
+        video.volume = parseFloat(e.target.value);
+        if (video.volume > 0) {
+          video.muted = false;
+          localStorage.setItem('playerMuted', false);
+        }
+        localStorage.setItem('playerVolume', video.volume);
+        updateVolumeIcon();
+        showControls();
+      });
+      
+      // Settings Menu
+      settingsBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        isSettingsOpen = !isSettingsOpen;
+        settingsMenu.classList.toggle('active', isSettingsOpen);
+        showControls();
+      });
+      
+      document.addEventListener('click', (e) => {
+        if (isSettingsOpen && !settingsDropdown.contains(e.target)) {
+          isSettingsOpen = false;
+          settingsMenu.classList.remove('active');
+        }
+      });
+      
+      settingsDropdown.querySelectorAll('.settings-item').forEach(item => {
+        item.addEventListener('click', () => {
+          const speed = parseFloat(item.dataset.speed);
+          video.playbackRate = speed;
+          settingsDropdown.querySelectorAll('.settings-item').forEach(i => {
+            i.classList.remove('selected');
+          });
+          item.classList.add('selected');
+          showControls();
+        });
+      });
+      
+      // FULLSCREEN FUNCTION - Click triggers fullscreen
+      fullscreenBtn.addEventListener('click', toggleFullscreen);
+      
+      function toggleFullscreen() {
+        if (!isFullscreen) {
+          if (playerContainer.requestFullscreen) {
+            playerContainer.requestFullscreen();
+          } else if (playerContainer.webkitRequestFullscreen) {
+            playerContainer.webkitRequestFullscreen();
+          } else if (playerContainer.msRequestFullscreen) {
+            playerContainer.msRequestFullscreen();
+          }
+          fullscreenBtn.innerHTML = '<i class="fas fa-compress"></i>';
+        } else {
+          if (document.exitFullscreen) {
+            document.exitFullscreen();
+          } else if (document.webkitExitFullscreen) {
+            document.webkitExitFullscreen();
+          } else if (document.msExitFullscreen) {
+            document.msExitFullscreen();
+          }
+          fullscreenBtn.innerHTML = '<i class="fas fa-expand"></i>';
+        }
+        showControls();
+      }
+      
+      // Listen for fullscreen change
+      document.addEventListener('fullscreenchange', () => {
+        isFullscreen = !!document.fullscreenElement;
+        fullscreenBtn.innerHTML = isFullscreen ? 
+          '<i class="fas fa-compress"></i>' : 
+          '<i class="fas fa-expand"></i>';
+      });
+      
+      document.addEventListener('webkitfullscreenchange', () => {
+        isFullscreen = !!document.webkitFullscreenElement;
+        fullscreenBtn.innerHTML = isFullscreen ? 
+          '<i class="fas fa-compress"></i>' : 
+          '<i class="fas fa-expand"></i>';
+      });
+      
+      document.addEventListener('msfullscreenchange', () => {
+        isFullscreen = !!document.msFullscreenElement;
+        fullscreenBtn.innerHTML = isFullscreen ? 
+          '<i class="fas fa-compress"></i>' : 
+          '<i class="fas fa-expand"></i>';
+      });
+      
+      // Double-click video for fullscreen
+      video.addEventListener('dblclick', toggleFullscreen);
+      
+      // Format Time
+      function formatTime(seconds) {
+        if (isNaN(seconds)) return '0:00';
+        const hrs = Math.floor(seconds / 3600);
+        const mins = Math.floor((seconds % 3600) / 60);
+        const secs = Math.floor(seconds % 60);
+        
+        if (hrs > 0) {
+          return hrs + ':' + 
+                 (mins < 10 ? '0' : '') + mins + ':' + 
+                 (secs < 10 ? '0' : '') + secs;
+        } else {
+          return mins + ':' + (secs < 10 ? '0' : '') + secs;
+        }
+      }
+      
+      // Keyboard Controls
+      document.addEventListener('keydown', (e) => {
+        if (e.target.tagName === 'INPUT') return;
+        
+        switch(e.key.toLowerCase()) {
+          case ' ':
+          case 'k':
+            e.preventDefault();
+            playBtn.click();
+            break;
+          case 'arrowleft':
+            rewindBtn.click();
+            break;
+          case 'arrowright':
+            forwardBtn.click();
+            break;
+          case 'arrowup':
+            e.preventDefault();
+            video.volume = Math.min(1, video.volume + 0.1);
+            volumeSlider.value = video.volume;
+            volumeSlider.dispatchEvent(new Event('input'));
+            break;
+          case 'arrowdown':
+            e.preventDefault();
+            video.volume = Math.max(0, video.volume - 0.1);
+            volumeSlider.value = video.volume;
+            volumeSlider.dispatchEvent(new Event('input'));
+            break;
+          case 'm':
+            volumeBtn.click();
+            break;
+          case 'f':
+            toggleFullscreen();
+            break;
+        }
+      });
+      
+      // Initialize
+      initPlayer();
+    });
   </script>
 </body>
 </html>`;
-
   res.send(html);
 });
 
-// Health check
-app.get('/health', (req, res) => {
-  res.json({
-    status: 'healthy',
-    tempDir: TEMP_DIR,
-    uptime: process.uptime(),
-    memory: process.memoryUsage()
-  });
-});
-
-// Export for Vercel
+// Start server
 if (process.env.VERCEL) {
   module.exports = app;
 } else {
   app.listen(PORT, () => {
-    console.log('=================================');
-    console.log('❄️ SNOW PLAYER PROFESSIONAL');
-    console.log('=================================');
-    console.log(`Server: http://localhost:${PORT}`);
-    console.log(`Downloader: http://localhost:${PORT}/downloader?url=YOUR_HLS_URL`);
-    console.log('=================================');
-    console.log('Features:');
-    console.log('• Complete HLS stream downloading');
-    console.log('• Quality selection (1080p, 720p, etc.)');
-    console.log('• Concurrent segment downloading');
-    console.log('• Real-time progress tracking');
-    console.log('• Automatic retry on failure');
-    console.log('• Segment-by-segment status');
-    console.log('• Download speed monitoring');
-    console.log('• Time remaining estimation');
-    console.log('=================================');
+    console.log(`Server running on http://localhost:${PORT}`);
   });
 }
